@@ -12,8 +12,10 @@ constructor_args:
       detector: true
       tracker: true
       candidate_debug: false
+      model_faces: false
     output_dir: "/tmp/autoaim_preview"
     raw_video_name: "raw.avi"
+    overlay_video_name: "overlay.avi"
     preview_window_name: "autoaim_preview"
     preview_scale: 0.5
     preview_wait_key_ms: 1
@@ -97,9 +99,10 @@ class VisionPreview : public LibXR::Application
 
   struct OverlayConfig
   {
-    bool detector = true;        // 绘制 detector 原始识别框、角点和 PnP 文本。
-    bool tracker = true;         // 绘制 tracker EKF 中心和装甲板投影点。
-    bool candidate_debug = false;  // 仅显示轻量候选统计，不画复杂候选表。
+    bool detector = true;       // 绘制 detector 原始识别框、角点和置信度。
+    bool tracker = true;        // 绘制 tracker 中心和匹配面 EKF 投影。
+    bool candidate_debug = false;  // 显示候选统计。
+    bool model_faces = false;      // 额外绘制 EKF 模型补全的全部装甲板点。
   };
 
   struct RuntimeParam
@@ -110,6 +113,7 @@ class VisionPreview : public LibXR::Application
     OverlayConfig overlay{};
     std::string_view output_dir = "/tmp/autoaim_preview";
     std::string_view raw_video_name = "raw.avi";
+    std::string_view overlay_video_name = "overlay.avi";
     std::string_view preview_window_name = "autoaim_preview";
     double preview_scale = 0.5;
     int preview_wait_key_ms = 1;
@@ -122,6 +126,7 @@ class VisionPreview : public LibXR::Application
         image_topic_name_(sync.ImageTopicName()),
         output_dir_(runtime.output_dir),
         raw_video_name_(runtime.raw_video_name),
+        overlay_video_name_(runtime.overlay_video_name),
         preview_window_name_(runtime.preview_window_name)
   {
     (void)hw;
@@ -267,6 +272,12 @@ class VisionPreview : public LibXR::Application
   bool ShouldRun() const
   {
     return runtime_.enabled && (runtime_.record_raw || runtime_.realtime_preview);
+  }
+
+  bool OverlayEnabled() const
+  {
+    return runtime_.overlay.detector || runtime_.overlay.tracker ||
+           runtime_.overlay.candidate_debug;
   }
 
   void RegisterCallbacks()
@@ -584,7 +595,7 @@ class VisionPreview : public LibXR::Application
       WriteRawVideo(bgr);
     }
 
-    if (!realtime_preview_enabled_)
+    if (!realtime_preview_enabled_ && !(RecordEnabled() && OverlayEnabled()))
     {
       return;
     }
@@ -595,13 +606,26 @@ class VisionPreview : public LibXR::Application
 
     if (runtime_.overlay.detector && snapshot.detector_valid)
     {
-      DrawDetector(canvas, snapshot.detector);
+      DrawDetector(canvas, snapshot.detector,
+                   snapshot.candidate_valid ? &snapshot.candidate : nullptr);
     }
     if (runtime_.overlay.tracker && snapshot.ekf_valid)
     {
-      DrawTracker(canvas, snapshot.ekf);
+      DrawTracker(canvas, snapshot.ekf,
+                  snapshot.detector_valid ? &snapshot.detector : nullptr,
+                  snapshot.candidate_valid ? &snapshot.candidate : nullptr);
     }
     DrawStatus(canvas, timestamp_us, snapshot);
+
+    if (RecordEnabled() && OverlayEnabled())
+    {
+      WriteOverlayVideo(canvas);
+    }
+
+    if (!realtime_preview_enabled_)
+    {
+      return;
+    }
 
     if (runtime_.preview_scale > 0.0 &&
         std::abs(runtime_.preview_scale - 1.0) > 1e-6)
@@ -700,11 +724,40 @@ class VisionPreview : public LibXR::Application
     return ARMOR_NUMBER_NAMES[index];
   }
 
-  void DrawDetector(cv::Mat& canvas, const DetectorMessage& detector)
+  std::array<int, CandidateDebugMessage::kMaxDetections> MatchedFaces(
+      const CandidateDebugMessage* candidate) const
   {
-    for (const auto& armor : detector.results)
+    std::array<int, CandidateDebugMessage::kMaxDetections> matched_faces{};
+    matched_faces.fill(-1);
+    if (candidate == nullptr || candidate->matched == 0U)
     {
+      return matched_faces;
+    }
+
+    const uint8_t count = std::min<uint8_t>(candidate->count,
+                                            CandidateDebugMessage::kMaxItems);
+    for (uint8_t i = 0; i < count; ++i)
+    {
+      const auto& item = candidate->items[i];
+      if (item.armor_index < matched_faces.size())
+      {
+        matched_faces[item.armor_index] = static_cast<int>(item.face_index);
+      }
+    }
+    return matched_faces;
+  }
+
+  void DrawDetector(cv::Mat& canvas, const DetectorMessage& detector,
+                    const CandidateDebugMessage* candidate)
+  {
+    const auto matched_faces = MatchedFaces(candidate);
+    for (std::size_t index = 0; index < detector.results.size(); ++index)
+    {
+      const auto& armor = detector.results[index];
+      const bool is_matched =
+          index < matched_faces.size() && matched_faces[index] >= 0;
       const cv::Scalar color = ArmorColorToScalar(armor.color);
+      const cv::Scalar draw_color = is_matched ? cv::Scalar(255, 0, 255) : color;
       std::array<cv::Point, 4> points{};
       for (std::size_t i = 0; i < armor.points.size(); ++i)
       {
@@ -712,65 +765,135 @@ class VisionPreview : public LibXR::Application
       }
       const cv::Point* polygon = points.data();
       const int point_count = static_cast<int>(points.size());
-      cv::polylines(canvas, &polygon, &point_count, 1, true, color, 2, cv::LINE_AA);
-      cv::rectangle(canvas, armor.box, color, 1, cv::LINE_AA);
+      cv::polylines(canvas, &polygon, &point_count, 1, true, draw_color, 2,
+                    cv::LINE_AA);
+      cv::rectangle(canvas, armor.box, draw_color, 1, cv::LINE_AA);
 
       std::ostringstream label;
-      label << ArmorNumberName(armor.number) << " "
-            << std::fixed << std::setprecision(2) << armor.confidence;
+      if (is_matched)
+      {
+        label << "M" << index << " f=" << matched_faces[index] << " ";
+      }
+      label << ArmorNumberName(armor.number) << " " << std::fixed
+            << std::setprecision(2) << armor.confidence;
       cv::putText(canvas, label.str(),
                   cv::Point(std::max(armor.box.x, 4), std::max(armor.box.y - 6, 18)),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv::LINE_AA);
+                  cv::FONT_HERSHEY_SIMPLEX, 0.55, draw_color, 1, cv::LINE_AA);
     }
   }
 
-  void DrawTracker(cv::Mat& canvas, const EkfPointsMessage& ekf)
+  bool ProjectPoint(const cv::Mat& canvas, const LibXR::Position<double>& point,
+                    cv::Point2d& uv) const
   {
     const cv::Mat camera_matrix = ScaledCameraMatrix(canvas);
     const cv::Mat dist_coeffs = DistCoeffs();
-    auto project = [&](const LibXR::Position<double>& point, cv::Point2d& uv)
+    const Eigen::Vector3d pc(point.x(), point.y(), point.z());
+    if (!(pc.z() > 1e-6) || !std::isfinite(pc.x()) || !std::isfinite(pc.y()) ||
+        !std::isfinite(pc.z()))
     {
-      const Eigen::Vector3d pc(point.x(), point.y(), point.z());
-      if (!(pc.z() > 1e-6) || !std::isfinite(pc.x()) || !std::isfinite(pc.y()) ||
-          !std::isfinite(pc.z()))
-      {
-        return false;
-      }
+      return false;
+    }
 
-      std::vector<cv::Point3d> object_points{cv::Point3d(pc.x(), pc.y(), pc.z())};
-      cv::Mat rvec = cv::Mat::zeros(1, 3, CV_64F);
-      cv::Mat tvec = cv::Mat::zeros(1, 3, CV_64F);
-      std::vector<cv::Point2d> image_points;
-      cv::projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs,
-                        image_points);
-      uv = image_points[0];
-      return uv.x >= 0.0 && uv.x < canvas.cols && uv.y >= 0.0 && uv.y < canvas.rows;
-    };
+    std::vector<cv::Point3d> object_points{cv::Point3d(pc.x(), pc.y(), pc.z())};
+    cv::Mat rvec = cv::Mat::zeros(1, 3, CV_64F);
+    cv::Mat tvec = cv::Mat::zeros(1, 3, CV_64F);
+    std::vector<cv::Point2d> image_points;
+    cv::projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs,
+                      image_points);
+    uv = image_points[0];
+    return uv.x >= 0.0 && uv.x < canvas.cols && uv.y >= 0.0 && uv.y < canvas.rows;
+  }
 
+  void DrawTracker(cv::Mat& canvas, const EkfPointsMessage& ekf,
+                   const DetectorMessage* detector,
+                   const CandidateDebugMessage* candidate)
+  {
     cv::Point2d center_uv;
-    const bool center_visible = ekf.valid[0] && project(ekf.center_cam, center_uv);
+    const bool center_visible =
+        ekf.valid[0] && ProjectPoint(canvas, ekf.center_cam, center_uv);
     if (center_visible)
     {
       cv::circle(canvas, center_uv, 5, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-      cv::putText(canvas, "T", center_uv + cv::Point2d(6, -6),
+      cv::putText(canvas, "TC", center_uv + cv::Point2d(6, -6),
                   cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 0), 1,
                   cv::LINE_AA);
+    }
+
+    DrawMatchedEkfFaces(canvas, ekf, detector, candidate);
+    if (!runtime_.overlay.model_faces)
+    {
+      return;
     }
 
     for (int i = 0; i < std::min<int>(ekf.count, 4); ++i)
     {
       cv::Point2d armor_uv;
-      if (!ekf.valid[i + 1] || !project(ekf.armors_cam[i], armor_uv))
+      if (!ekf.valid[i + 1] || !ProjectPoint(canvas, ekf.armors_cam[i], armor_uv))
       {
         continue;
       }
 
-      cv::circle(canvas, armor_uv, 4, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+      cv::circle(canvas, armor_uv, 3, cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
+      std::ostringstream label;
+      label << "model" << i;
+      cv::putText(canvas, label.str(), armor_uv + cv::Point2d(7, -7),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(180, 180, 180), 1,
+                  cv::LINE_AA);
       if (center_visible)
       {
-        cv::line(canvas, center_uv, armor_uv, cv::Scalar(80, 180, 255), 1,
+        cv::line(canvas, center_uv, armor_uv, cv::Scalar(120, 120, 120), 1,
                  cv::LINE_AA);
       }
+    }
+  }
+
+  void DrawMatchedEkfFaces(cv::Mat& canvas, const EkfPointsMessage& ekf,
+                           const DetectorMessage* detector,
+                           const CandidateDebugMessage* candidate)
+  {
+    if (detector == nullptr || candidate == nullptr || candidate->matched == 0U)
+    {
+      return;
+    }
+
+    const double sx = static_cast<double>(canvas.cols) /
+                      static_cast<double>(std::max<uint32_t>(camera_info.width, 1));
+    const double sy = static_cast<double>(canvas.rows) /
+                      static_cast<double>(std::max<uint32_t>(camera_info.height, 1));
+    const uint8_t count = std::min<uint8_t>(candidate->count,
+                                            CandidateDebugMessage::kMaxItems);
+    for (uint8_t i = 0; i < count; ++i)
+    {
+      const auto& item = candidate->items[i];
+      if (item.armor_index >= detector->results.size())
+      {
+        continue;
+      }
+      const int face_index = static_cast<int>(item.face_index);
+      if (face_index < 0 || face_index >= 4 || face_index >= ekf.count ||
+          !ekf.valid[face_index + 1])
+      {
+        continue;
+      }
+
+      cv::Point2d ef_uv;
+      if (!ProjectPoint(canvas, ekf.armors_cam[face_index], ef_uv))
+      {
+        continue;
+      }
+
+      const auto& armor = detector->results[item.armor_index];
+      const cv::Point2d det_uv(armor.center.x * sx, armor.center.y * sy);
+      const double err_px = std::hypot(ef_uv.x - det_uv.x, ef_uv.y - det_uv.y);
+      cv::circle(canvas, ef_uv, 6, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+      cv::line(canvas, det_uv, ef_uv, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+
+      std::ostringstream label;
+      label << "EF f=" << face_index << " e=" << std::fixed
+            << std::setprecision(0) << err_px;
+      cv::putText(canvas, label.str(), ef_uv + cv::Point2d(8, -8),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255, 255, 0), 1,
+                  cv::LINE_AA);
     }
   }
 
@@ -860,8 +983,9 @@ class VisionPreview : public LibXR::Application
     target_file_.open(output_dir_ + "/target.tsv", std::ios::out);
     ekf_file_.open(output_dir_ + "/ekf_points.tsv", std::ios::out);
     candidate_file_.open(output_dir_ + "/candidate_debug.tsv", std::ios::out);
+    candidate_items_file_.open(output_dir_ + "/candidate_items.tsv", std::ios::out);
     if (!detector_file_ || !metrics_file_ || !target_file_ || !ekf_file_ ||
-        !candidate_file_)
+        !candidate_file_ || !candidate_items_file_)
     {
       XR_LOG_ERROR("VisionPreview failed to open record files under: %s",
                    output_dir_.c_str());
@@ -878,6 +1002,11 @@ class VisionPreview : public LibXR::Application
     ekf_file_ << "image_timestamp_us\tpoint_index\tvalid\tx\ty\tz\n";
     candidate_file_ << "image_timestamp_us\tcount\tselected_index\tmatched"
                     << "\tdetection_count\ttracked_armors_num\n";
+    candidate_items_file_ << "image_timestamp_us\titem_index\tarmor_index"
+                          << "\tface_index\tsame_number\timage_track_id"
+                          << "\timage_track_confirmed\tnumber\ttype\tscore"
+                          << "\tposition_diff\tyaw_diff\tcenter_x\tcenter_y"
+                          << "\tpredicted_yaw\tmeasured_yaw\n";
     record_ready_ = true;
     FlushRecordFiles();
   }
@@ -897,6 +1026,23 @@ class VisionPreview : public LibXR::Application
       }
     }
     raw_writer_.write(bgr);
+  }
+
+  void WriteOverlayVideo(const cv::Mat& bgr)
+  {
+    if (!overlay_writer_ready_)
+    {
+      const std::string path = output_dir_ + "/" + overlay_video_name_;
+      const int fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+      overlay_writer_ready_ = overlay_writer_.open(
+          path, fourcc, runtime_.record_fps, cv::Size(bgr.cols, bgr.rows), true);
+      if (!overlay_writer_ready_)
+      {
+        XR_LOG_ERROR("VisionPreview failed to open overlay video: %s", path.c_str());
+        return;
+      }
+    }
+    overlay_writer_.write(bgr);
   }
 
   void WriteRecords(const std::vector<DetectorMessage>& detector_records,
@@ -972,6 +1118,26 @@ class VisionPreview : public LibXR::Application
                       << static_cast<int>(candidate.matched) << '\t'
                       << static_cast<int>(candidate.detection_count) << '\t'
                       << static_cast<int>(candidate.tracked_armors_num) << '\n';
+      const uint8_t count = std::min<uint8_t>(candidate.count,
+                                              CandidateDebugMessage::kMaxItems);
+      for (uint8_t i = 0; i < count; ++i)
+      {
+        const auto& item = candidate.items[i];
+        candidate_items_file_ << candidate.image_timestamp_us << '\t'
+                              << static_cast<int>(i) << '\t'
+                              << static_cast<int>(item.armor_index) << '\t'
+                              << static_cast<int>(item.face_index) << '\t'
+                              << static_cast<int>(item.same_number) << '\t'
+                              << static_cast<int>(item.image_track_id) << '\t'
+                              << static_cast<int>(item.image_track_confirmed)
+                              << '\t' << static_cast<int>(item.number) << '\t'
+                              << static_cast<int>(item.type) << '\t'
+                              << item.score << '\t' << item.position_diff
+                              << '\t' << item.yaw_diff << '\t' << item.center_x
+                              << '\t' << item.center_y << '\t'
+                              << item.predicted_yaw << '\t'
+                              << item.measured_yaw << '\n';
+      }
     }
 
     FlushRecordFiles();
@@ -984,6 +1150,7 @@ class VisionPreview : public LibXR::Application
     target_file_.flush();
     ekf_file_.flush();
     candidate_file_.flush();
+    candidate_items_file_.flush();
   }
 
   bool RecordEnabled() const
@@ -995,6 +1162,7 @@ class VisionPreview : public LibXR::Application
   std::string image_topic_name_;
   std::string output_dir_;
   std::string raw_video_name_;
+  std::string overlay_video_name_;
   std::string preview_window_name_;
 
   std::atomic<bool> running_{false};
@@ -1027,7 +1195,10 @@ class VisionPreview : public LibXR::Application
   std::ofstream target_file_{};
   std::ofstream ekf_file_{};
   std::ofstream candidate_file_{};
+  std::ofstream candidate_items_file_{};
   cv::VideoWriter raw_writer_{};
+  cv::VideoWriter overlay_writer_{};
   bool raw_writer_ready_{false};
+  bool overlay_writer_ready_{false};
   bool record_ready_{false};
 };
