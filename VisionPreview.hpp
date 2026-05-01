@@ -116,7 +116,7 @@ class VisionPreview : public LibXR::Application
     bool tracker = true;           // 绘制 tracker EKF 中心和装甲板投影点。
     bool aimer_trajectory = true;  // 绘制 Aimer 发布的模型弹道。
     bool candidate_debug = false;  // 仅显示轻量候选统计，不画复杂候选表。
-    bool model_faces = false;      // 绘制未观测的模型补全面，仅作几何参考。
+    bool model_faces = false;      // 绘制全部预测 face，仅作刚体模型参考。
   };
 
   struct RuntimeParam
@@ -1200,11 +1200,15 @@ class VisionPreview : public LibXR::Application
       }
 
       cv::Point projected_center;
+      static const std::array<cv::Scalar, 4> face_colors = {
+          cv::Scalar(255, 220, 40), cv::Scalar(40, 220, 255),
+          cv::Scalar(80, 255, 80), cv::Scalar(255, 120, 255)};
       const cv::Scalar color =
-          selected_face ? cv::Scalar(255, 0, 255) : cv::Scalar(80, 105, 95);
+          selected_face ? cv::Scalar(255, 0, 255)
+                        : face_colors[static_cast<std::size_t>(i) % face_colors.size()];
       std::ostringstream label;
-      label << (selected_face ? "EF" : "MF") << i;
-      if (!DrawProjectedArmor(canvas, points, color, selected_face ? 3 : 1,
+      label << (selected_face ? "EF" : "F") << i;
+      if (!DrawProjectedArmor(canvas, points, color, selected_face ? 3 : 2,
                               label.str(), &projected_center))
       {
         continue;
