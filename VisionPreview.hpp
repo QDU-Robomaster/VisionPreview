@@ -116,7 +116,7 @@ class VisionPreview : public LibXR::Application
     bool tracker = true;           // 绘制 tracker EKF 中心和装甲板投影点。
     bool aimer_trajectory = true;  // 绘制 Aimer 发布的模型弹道。
     bool candidate_debug = false;  // 仅显示轻量候选统计，不画复杂候选表。
-    bool model_faces = false;      // 绘制未观测的模型补全装甲板。
+    bool model_faces = false;      // 绘制未观测的模型补全面，仅作几何参考。
   };
 
   struct RuntimeParam
@@ -1140,7 +1140,9 @@ class VisionPreview : public LibXR::Application
     const cv::Size frame_size(canvas.cols, canvas.rows);
     const ArmorType armor_type = OverlayArmorType(snapshot);
     const auto* selected =
-        snapshot.candidate_valid ? SelectedCandidate(&snapshot.candidate) : nullptr;
+        (snapshot.candidate_valid && snapshot.candidate.matched != 0)
+            ? SelectedCandidate(&snapshot.candidate)
+            : nullptr;
 
     cv::Point2d center_uv;
     const bool center_visible =
@@ -1199,15 +1201,15 @@ class VisionPreview : public LibXR::Application
 
       cv::Point projected_center;
       const cv::Scalar color =
-          selected_face ? cv::Scalar(255, 0, 255) : cv::Scalar(170, 180, 40);
+          selected_face ? cv::Scalar(255, 0, 255) : cv::Scalar(80, 105, 95);
       std::ostringstream label;
-      label << (selected_face ? "EF" : "F") << i;
+      label << (selected_face ? "EF" : "MF") << i;
       if (!DrawProjectedArmor(canvas, points, color, selected_face ? 3 : 1,
                               label.str(), &projected_center))
       {
         continue;
       }
-      if (center_visible)
+      if (selected_face && center_visible)
       {
         cv::line(canvas, cv::Point(cvRound(center_uv.x), cvRound(center_uv.y)),
                  projected_center, cv::Scalar(80, 180, 255), 1, cv::LINE_AA);
@@ -1493,7 +1495,9 @@ class VisionPreview : public LibXR::Application
                  << "\tvel_x\tvel_y\tvel_z\tyaw\tv_yaw\tradius_1\tradius_2\tdz\n";
     ekf_file_ << "image_timestamp_us\tpoint_index\tvalid\tx\ty\tz\n";
     candidate_file_ << "image_timestamp_us\tcount\tselected_index\tmatched"
-                    << "\tdetection_count\ttracked_armors_num\n";
+                    << "\tdetection_count\ttracked_armors_num\tselected_armor_index"
+                    << "\tselected_face_index\tselected_track_id\tselected_confirmed"
+                    << "\tselected_score\tselected_position_diff\tselected_yaw_diff\n";
 #if VISION_PREVIEW_HAS_AIMER
     trajectory_file_ << "image_timestamp_us\tvalid\tfire\tconverged\tpoint_index"
                      << "\ttarget_id\tselected_armor_index\tbullet_speed"
@@ -1620,12 +1624,27 @@ class VisionPreview : public LibXR::Application
 
     for (const auto& candidate : candidate_records)
     {
+      const auto* selected =
+          candidate.matched != 0 ? SelectedCandidate(&candidate) : nullptr;
       candidate_file_ << candidate.image_timestamp_us << '\t'
                       << static_cast<int>(candidate.count) << '\t'
                       << static_cast<int>(candidate.selected_index) << '\t'
                       << static_cast<int>(candidate.matched) << '\t'
                       << static_cast<int>(candidate.detection_count) << '\t'
-                      << static_cast<int>(candidate.tracked_armors_num) << '\n';
+                      << static_cast<int>(candidate.tracked_armors_num) << '\t';
+      if (selected == nullptr)
+      {
+        candidate_file_ << "-1\t-1\t-1\t0\t0\t0\t0\n";
+      }
+      else
+      {
+        candidate_file_ << static_cast<int>(selected->armor_index) << '\t'
+                        << static_cast<int>(selected->face_index) << '\t'
+                        << selected->image_track_id << '\t'
+                        << static_cast<int>(selected->image_track_confirmed) << '\t'
+                        << selected->score << '\t' << selected->position_diff << '\t'
+                        << selected->yaw_diff << '\n';
+      }
     }
 
     FlushRecordFiles();

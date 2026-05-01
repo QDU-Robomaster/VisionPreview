@@ -22,6 +22,6 @@
 - `overlay.tracker`：绘制 tracker 中心 `TC`、选中的 detector 观测 `M`、选中的 EKF face `EF` 以及二者误差线。
 - `overlay.aimer_trajectory`：绘制 Aimer 的模型弹道曲线和命中点。
 - `overlay.candidate_debug`：显示候选统计。
-- `overlay.model_faces`：额外绘制未观测的模型补全装甲板；默认关闭，避免把模型补全误读成观测证据。
+- `overlay.model_faces`：额外绘制未观测的模型补全面 `MF*`；默认关闭。`MF*` 只表示 tracker 刚体模型补全，不是 detector 观测，也不作为误差评价依据。
 
 关闭 `record_raw`、`record_overlay` 和 `realtime_preview` 时，模块不会启动线程或注册回调。
