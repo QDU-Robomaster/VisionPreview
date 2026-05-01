@@ -7,13 +7,16 @@ constructor_args:
   runtime:
     enabled: false
     record_raw: false
+    record_overlay: false
     realtime_preview: false
     overlay:
       detector: true
       tracker: true
+      aimer_trajectory: true
       candidate_debug: false
     output_dir: "/tmp/autoaim_preview"
     raw_video_name: "raw.avi"
+    overlay_video_name: "overlay.avi"
     preview_window_name: "autoaim_preview"
     preview_scale: 0.5
     preview_wait_key_ms: 1
@@ -38,17 +41,23 @@ depends:
 === END MANIFEST === */
 // clang-format on
 
+#include <Eigen/Dense>
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <condition_variable>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -56,12 +65,12 @@ depends:
 #include <utility>
 #include <vector>
 
-#include <Eigen/Dense>
-#include <opencv2/calib3d.hpp>
-#include <opencv2/core.hpp>
-#include <opencv2/highgui.hpp>
-#include <opencv2/imgproc.hpp>
-#include <opencv2/videoio.hpp>
+#if __has_include("Aimer.hpp")
+#include "Aimer.hpp"
+#define VISION_PREVIEW_HAS_AIMER 1
+#else
+#define VISION_PREVIEW_HAS_AIMER 0
+#endif
 
 #include "ArmorTracker.hpp"
 #include "CameraFrameSync.hpp"
@@ -87,6 +96,9 @@ class VisionPreview : public LibXR::Application
   using TargetMessage = SolveTrajectory::Target;
   using EkfPointsMessage = typename Tracker::EkfPointsMsg;
   using CandidateDebugMessage = typename Tracker::CandidateDebugMsg;
+#if VISION_PREVIEW_HAS_AIMER
+  using AimerTrajectory = Aimer::AimerTrajectory;
+#endif
 
   static inline constexpr auto camera_info = CameraInfoV;
   static constexpr std::size_t image_queue_capacity = 8;
@@ -98,19 +110,22 @@ class VisionPreview : public LibXR::Application
 
   struct OverlayConfig
   {
-    bool detector = true;        // 绘制 detector 原始识别框、角点和 PnP 文本。
-    bool tracker = true;         // 绘制 tracker EKF 中心和装甲板投影点。
+    bool detector = true;          // 绘制 detector 原始识别框、角点和 PnP 文本。
+    bool tracker = true;           // 绘制 tracker EKF 中心和装甲板投影点。
+    bool aimer_trajectory = true;  // 绘制 Aimer 发布的模型弹道。
     bool candidate_debug = false;  // 仅显示轻量候选统计，不画复杂候选表。
   };
 
   struct RuntimeParam
   {
-    bool enabled = false;            // 总开关；关闭时不注册回调、不启动线程。
-    bool record_raw = false;         // 原始视频和 topic 数据落盘。
-    bool realtime_preview = false;   // 实时窗口预览。
+    bool enabled = false;           // 总开关；关闭时不注册回调、不启动线程。
+    bool record_raw = false;        // 原始视频和 topic 数据落盘。
+    bool record_overlay = false;    // 直接写 overlay 后的视频，不依赖窗口录屏。
+    bool realtime_preview = false;  // 实时窗口预览。
     OverlayConfig overlay{};
     std::string_view output_dir = "/tmp/autoaim_preview";
     std::string_view raw_video_name = "raw.avi";
+    std::string_view overlay_video_name = "overlay.avi";
     std::string_view preview_window_name = "autoaim_preview";
     double preview_scale = 0.5;
     int preview_wait_key_ms = 1;
@@ -123,6 +138,7 @@ class VisionPreview : public LibXR::Application
         image_topic_name_(sync.ImageTopicName()),
         output_dir_(runtime.output_dir),
         raw_video_name_(runtime.raw_video_name),
+        overlay_video_name_(runtime.overlay_video_name),
         preview_window_name_(runtime.preview_window_name)
   {
     (void)hw;
@@ -136,6 +152,11 @@ class VisionPreview : public LibXR::Application
     if (runtime_.realtime_preview && !realtime_preview_enabled_)
     {
       XR_LOG_WARN("VisionPreview realtime preview disabled: display backend unavailable");
+    }
+    if (!runtime_.record_raw && !runtime_.record_overlay && !realtime_preview_enabled_)
+    {
+      XR_LOG_INFO("VisionPreview disabled: no available output");
+      return;
     }
 
     if (runtime_.record_raw)
@@ -160,10 +181,20 @@ class VisionPreview : public LibXR::Application
   void OnMonitor() override
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    XR_LOG_INFO("VisionPreview monitor: image_dropped=%u detector_dropped=%u tracker_dropped=%u",
-                static_cast<unsigned>(image_dropped_),
-                static_cast<unsigned>(detector_dropped_),
-                static_cast<unsigned>(tracker_dropped_));
+#if VISION_PREVIEW_HAS_AIMER
+    XR_LOG_INFO(
+        "VisionPreview monitor: image_dropped=%u detector_dropped=%u tracker_dropped=%u"
+        " trajectory_dropped=%u",
+        static_cast<unsigned>(image_dropped_), static_cast<unsigned>(detector_dropped_),
+        static_cast<unsigned>(tracker_dropped_),
+        static_cast<unsigned>(trajectory_dropped_));
+#else
+    XR_LOG_INFO(
+        "VisionPreview monitor: image_dropped=%u detector_dropped=%u "
+        "tracker_dropped=%u",
+        static_cast<unsigned>(image_dropped_), static_cast<unsigned>(detector_dropped_),
+        static_cast<unsigned>(tracker_dropped_));
+#endif
   }
 
  private:
@@ -226,10 +257,16 @@ class VisionPreview : public LibXR::Application
     bool target_valid = false;
     bool ekf_valid = false;
     bool candidate_valid = false;
+#if VISION_PREVIEW_HAS_AIMER
+    bool trajectory_valid = false;
+#endif
     DetectorMessage detector{};
     TargetMessage target{};
     EkfPointsMessage ekf{};
     CandidateDebugMessage candidate{};
+#if VISION_PREVIEW_HAS_AIMER
+    AimerTrajectory trajectory{};
+#endif
   };
 
   static uint64_t TimestampOf(const DetectorMessage& message)
@@ -257,6 +294,13 @@ class VisionPreview : public LibXR::Application
     return message.image_timestamp_us;
   }
 
+#if VISION_PREVIEW_HAS_AIMER
+  static uint64_t TimestampOf(const AimerTrajectory& message)
+  {
+    return message.image_timestamp_us;
+  }
+#endif
+
   static bool UiAvailable()
   {
     const char* display = std::getenv("DISPLAY");
@@ -267,14 +311,20 @@ class VisionPreview : public LibXR::Application
 
   bool ShouldRun() const
   {
-    return runtime_.enabled && (runtime_.record_raw || runtime_.realtime_preview);
+    return runtime_.enabled &&
+           (runtime_.record_raw || runtime_.record_overlay || runtime_.realtime_preview);
+  }
+
+  bool OverlayOutputEnabled() const
+  {
+    return runtime_.record_overlay || realtime_preview_enabled_;
   }
 
   void RegisterCallbacks()
   {
     LibXR::Topic::Domain detector_domain("armor_detector");
-    LibXR::Topic detector_topic(LibXR::Topic::WaitTopic("armors_result", UINT32_MAX,
-                                                        &detector_domain));
+    LibXR::Topic detector_topic(
+        LibXR::Topic::WaitTopic("armors_result", UINT32_MAX, &detector_domain));
     auto detector_callback = LibXR::Topic::Callback::Create(
         [](bool, Self* self, LibXR::RawData& data)
         {
@@ -284,8 +334,8 @@ class VisionPreview : public LibXR::Application
         this);
     detector_topic.RegisterCallback(detector_callback);
 
-    LibXR::Topic metrics_topic(LibXR::Topic::WaitTopic("metrics", UINT32_MAX,
-                                                       &detector_domain));
+    LibXR::Topic metrics_topic(
+        LibXR::Topic::WaitTopic("metrics", UINT32_MAX, &detector_domain));
     auto metrics_callback = LibXR::Topic::Callback::Create(
         [](bool, Self* self, LibXR::RawData& data)
         {
@@ -296,8 +346,8 @@ class VisionPreview : public LibXR::Application
     metrics_topic.RegisterCallback(metrics_callback);
 
     LibXR::Topic::Domain tracker_domain("tracker");
-    LibXR::Topic target_topic(LibXR::Topic::WaitTopic("target", UINT32_MAX,
-                                                      &tracker_domain));
+    LibXR::Topic target_topic(
+        LibXR::Topic::WaitTopic("target", UINT32_MAX, &tracker_domain));
     auto target_callback = LibXR::Topic::Callback::Create(
         [](bool, Self* self, LibXR::RawData& data)
         {
@@ -307,8 +357,8 @@ class VisionPreview : public LibXR::Application
         this);
     target_topic.RegisterCallback(target_callback);
 
-    LibXR::Topic ekf_topic(LibXR::Topic::WaitTopic("ekf_points", UINT32_MAX,
-                                                   &tracker_domain));
+    LibXR::Topic ekf_topic(
+        LibXR::Topic::WaitTopic("ekf_points", UINT32_MAX, &tracker_domain));
     auto ekf_callback = LibXR::Topic::Callback::Create(
         [](bool, Self* self, LibXR::RawData& data)
         {
@@ -318,16 +368,31 @@ class VisionPreview : public LibXR::Application
         this);
     ekf_topic.RegisterCallback(ekf_callback);
 
-    LibXR::Topic candidate_topic(LibXR::Topic::WaitTopic("candidate_debug", UINT32_MAX,
-                                                         &tracker_domain));
+    LibXR::Topic candidate_topic(
+        LibXR::Topic::WaitTopic("candidate_debug", UINT32_MAX, &tracker_domain));
     auto candidate_callback = LibXR::Topic::Callback::Create(
         [](bool, Self* self, LibXR::RawData& data)
         {
-          const auto* message = reinterpret_cast<const CandidateDebugMessage*>(data.addr_);
+          const auto* message =
+              reinterpret_cast<const CandidateDebugMessage*>(data.addr_);
           self->PushCandidate(*message);
         },
         this);
     candidate_topic.RegisterCallback(candidate_callback);
+
+#if VISION_PREVIEW_HAS_AIMER
+    LibXR::Topic::Domain aimer_domain("aimer");
+    LibXR::Topic trajectory_topic(
+        LibXR::Topic::FindOrCreate<AimerTrajectory>("trajectory", &aimer_domain));
+    auto trajectory_callback = LibXR::Topic::Callback::Create(
+        [](bool, Self* self, LibXR::RawData& data)
+        {
+          const auto* message = reinterpret_cast<const AimerTrajectory*>(data.addr_);
+          self->PushTrajectory(*message);
+        },
+        this);
+    trajectory_topic.RegisterCallback(trajectory_callback);
+#endif
   }
 
   void PushDetector(const DetectorMessage& message)
@@ -335,7 +400,7 @@ class VisionPreview : public LibXR::Application
     // topic 回调只拷贝消息并入队，绘制和文件写入都放到 worker 线程。
     std::lock_guard<std::mutex> lock(mutex_);
     detector_history_.Push(message);
-    if (RecordEnabled())
+    if (RawRecordEnabled())
     {
       detector_record_queue_.Push(message);
       detector_dropped_ = detector_record_queue_.dropped;
@@ -347,7 +412,7 @@ class VisionPreview : public LibXR::Application
   {
     // metrics 不参与 overlay 对齐，只在落盘模式下排队写出。
     std::lock_guard<std::mutex> lock(mutex_);
-    if (RecordEnabled())
+    if (RawRecordEnabled())
     {
       metrics_record_queue_.Push(message);
     }
@@ -358,7 +423,7 @@ class VisionPreview : public LibXR::Application
   {
     std::lock_guard<std::mutex> lock(mutex_);
     target_history_.Push(message);
-    if (RecordEnabled())
+    if (RawRecordEnabled())
     {
       target_record_queue_.Push(message);
       tracker_dropped_ = target_record_queue_.dropped;
@@ -370,7 +435,7 @@ class VisionPreview : public LibXR::Application
   {
     std::lock_guard<std::mutex> lock(mutex_);
     ekf_history_.Push(message);
-    if (RecordEnabled())
+    if (RawRecordEnabled())
     {
       ekf_record_queue_.Push(message);
     }
@@ -381,17 +446,32 @@ class VisionPreview : public LibXR::Application
   {
     std::lock_guard<std::mutex> lock(mutex_);
     candidate_history_.Push(message);
-    if (RecordEnabled())
+    if (RawRecordEnabled())
     {
       candidate_record_queue_.Push(message);
     }
     work_cv_.notify_one();
   }
 
+#if VISION_PREVIEW_HAS_AIMER
+  void PushTrajectory(const AimerTrajectory& message)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    trajectory_history_.Push(message);
+    if (RawRecordEnabled())
+    {
+      trajectory_record_queue_.Push(message);
+      trajectory_dropped_ = trajectory_record_queue_.dropped;
+    }
+    work_cv_.notify_one();
+  }
+#endif
+
   static void ImageThreadMain(Self* self)
   {
-    typename ImageTopic::Subscriber image_sub(self->image_topic_name_.c_str(),
-                                              LibXR::LinuxSharedSubscriberMode::BROADCAST_DROP_OLD);
+    typename ImageTopic::Subscriber image_sub(
+        self->image_topic_name_.c_str(),
+        LibXR::LinuxSharedSubscriberMode::BROADCAST_DROP_OLD);
     if (!image_sub.Valid())
     {
       XR_LOG_ERROR("VisionPreview failed to attach image topic: %s",
@@ -442,7 +522,7 @@ class VisionPreview : public LibXR::Application
     {
       return false;
     }
-    if (!realtime_preview_enabled_)
+    if (!OverlayOutputEnabled())
     {
       return true;
     }
@@ -456,7 +536,7 @@ class VisionPreview : public LibXR::Application
       return false;
     }
 
-    if (realtime_preview_enabled_)
+    if (OverlayOutputEnabled())
     {
       if (image_count_ <= realtime_preview_delay_frames)
       {
@@ -484,12 +564,13 @@ class VisionPreview : public LibXR::Application
 
   bool HasWorkLocked() const
   {
-    return ImageReadyLocked() ||
-           !detector_record_queue_.Empty() ||
-           !metrics_record_queue_.Empty() ||
-           !target_record_queue_.Empty() ||
-           !ekf_record_queue_.Empty() ||
-           !candidate_record_queue_.Empty();
+    return ImageReadyLocked() || !detector_record_queue_.Empty() ||
+           !metrics_record_queue_.Empty() || !target_record_queue_.Empty() ||
+           !ekf_record_queue_.Empty() || !candidate_record_queue_.Empty()
+#if VISION_PREVIEW_HAS_AIMER
+           || !trajectory_record_queue_.Empty()
+#endif
+        ;
   }
 
   static void WorkerThreadMain(Self* self)
@@ -502,13 +583,14 @@ class VisionPreview : public LibXR::Application
       std::vector<TargetMessage> target_records;
       std::vector<EkfPointsMessage> ekf_records;
       std::vector<CandidateDebugMessage> candidate_records;
+#if VISION_PREVIEW_HAS_AIMER
+      std::vector<AimerTrajectory> trajectory_records;
+#endif
 
       {
         std::unique_lock<std::mutex> lock(self->mutex_);
-        self->work_cv_.wait(lock, [self]()
-        {
-          return !self->running_ || self->HasWorkLocked();
-        });
+        self->work_cv_.wait(
+            lock, [self]() { return !self->running_ || self->HasWorkLocked(); });
         if (!self->running_)
         {
           return;
@@ -517,10 +599,16 @@ class VisionPreview : public LibXR::Application
         (void)self->PopImageLocked(image);
         self->DrainRecordQueuesLocked(detector_records, metrics_records, target_records,
                                       ekf_records, candidate_records);
+#if VISION_PREVIEW_HAS_AIMER
+        self->DrainTrajectoryRecordsLocked(trajectory_records);
+#endif
       }
 
       self->WriteRecords(detector_records, metrics_records, target_records, ekf_records,
                          candidate_records);
+#if VISION_PREVIEW_HAS_AIMER
+      self->WriteTrajectoryRecords(trajectory_records);
+#endif
       if (image.Valid())
       {
         self->ProcessImage(image);
@@ -565,6 +653,17 @@ class VisionPreview : public LibXR::Application
     }
   }
 
+#if VISION_PREVIEW_HAS_AIMER
+  void DrainTrajectoryRecordsLocked(std::vector<AimerTrajectory>& trajectory_records)
+  {
+    AimerTrajectory trajectory;
+    while (trajectory_record_queue_.PopOldest(trajectory))
+    {
+      trajectory_records.push_back(trajectory);
+    }
+  }
+#endif
+
   FrameSnapshot SnapshotFor(uint64_t timestamp_us)
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -576,6 +675,10 @@ class VisionPreview : public LibXR::Application
     snapshot.ekf_valid = ekf_history_.FindByTimestamp(timestamp_us, snapshot.ekf);
     snapshot.candidate_valid =
         candidate_history_.FindByTimestamp(timestamp_us, snapshot.candidate);
+#if VISION_PREVIEW_HAS_AIMER
+    snapshot.trajectory_valid =
+        trajectory_history_.FindByTimestamp(timestamp_us, snapshot.trajectory);
+#endif
     return snapshot;
   }
 
@@ -595,9 +698,8 @@ class VisionPreview : public LibXR::Application
       return;
     }
 
-    cv::Mat raw(static_cast<int>(camera_info.height),
-                static_cast<int>(camera_info.width), cv_type,
-                const_cast<uint8_t*>(image_frame->data.data()),
+    cv::Mat raw(static_cast<int>(camera_info.height), static_cast<int>(camera_info.width),
+                cv_type, const_cast<uint8_t*>(image_frame->data.data()),
                 static_cast<std::size_t>(camera_info.step));
     cv::Mat bgr = ConvertToBgr(raw, camera_info.encoding);
     if (bgr.empty())
@@ -605,12 +707,12 @@ class VisionPreview : public LibXR::Application
       return;
     }
 
-    if (RecordEnabled())
+    if (RawRecordEnabled())
     {
       WriteRawVideo(bgr);
     }
 
-    if (!realtime_preview_enabled_)
+    if (!OverlayOutputEnabled())
     {
       return;
     }
@@ -627,10 +729,26 @@ class VisionPreview : public LibXR::Application
     {
       DrawTracker(canvas, snapshot.ekf);
     }
+#if VISION_PREVIEW_HAS_AIMER
+    if (runtime_.overlay.aimer_trajectory && snapshot.trajectory_valid &&
+        snapshot.target_valid && snapshot.ekf_valid)
+    {
+      DrawAimerTrajectory(canvas, snapshot.target, snapshot.ekf, snapshot.trajectory);
+    }
+#endif
     DrawStatus(canvas, timestamp_us, snapshot);
 
-    if (runtime_.preview_scale > 0.0 &&
-        std::abs(runtime_.preview_scale - 1.0) > 1e-6)
+    if (runtime_.record_overlay)
+    {
+      WriteOverlayVideo(canvas);
+    }
+
+    if (!realtime_preview_enabled_)
+    {
+      return;
+    }
+
+    if (runtime_.preview_scale > 0.0 && std::abs(runtime_.preview_scale - 1.0) > 1e-6)
     {
       cv::Mat scaled;
       cv::resize(canvas, scaled, cv::Size(), runtime_.preview_scale,
@@ -742,8 +860,8 @@ class VisionPreview : public LibXR::Application
       cv::rectangle(canvas, armor.box, color, 1, cv::LINE_AA);
 
       std::ostringstream label;
-      label << ArmorNumberName(armor.number) << " "
-            << std::fixed << std::setprecision(2) << armor.confidence;
+      label << ArmorNumberName(armor.number) << " " << std::fixed << std::setprecision(2)
+            << armor.confidence;
       cv::putText(canvas, label.str(),
                   cv::Point(std::max(armor.box.x, 4), std::max(armor.box.y - 6, 18)),
                   cv::FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv::LINE_AA);
@@ -778,9 +896,8 @@ class VisionPreview : public LibXR::Application
     if (center_visible)
     {
       cv::circle(canvas, center_uv, 5, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-      cv::putText(canvas, "T", center_uv + cv::Point2d(6, -6),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 0), 1,
-                  cv::LINE_AA);
+      cv::putText(canvas, "T", center_uv + cv::Point2d(6, -6), cv::FONT_HERSHEY_SIMPLEX,
+                  0.55, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
     }
 
     for (int i = 0; i < std::min<int>(ekf.count, 4); ++i)
@@ -794,17 +911,181 @@ class VisionPreview : public LibXR::Application
       cv::circle(canvas, armor_uv, 4, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
       if (center_visible)
       {
-        cv::line(canvas, center_uv, armor_uv, cv::Scalar(80, 180, 255), 1,
-                 cv::LINE_AA);
+        cv::line(canvas, center_uv, armor_uv, cv::Scalar(80, 180, 255), 1, cv::LINE_AA);
       }
     }
   }
 
+#if VISION_PREVIEW_HAS_AIMER
+  static Eigen::Vector3d ToVector(const LibXR::Position<double>& point)
+  {
+    return Eigen::Vector3d(point.x(), point.y(), point.z());
+  }
+
+  static std::vector<Eigen::Vector3d> BuildTargetArmorWorldPoints(
+      const TargetMessage& target)
+  {
+    static constexpr double pi = 3.14159265358979323846;
+    std::vector<Eigen::Vector3d> points;
+    const int count = std::clamp(target.armors_num, 0, 4);
+    points.reserve(static_cast<std::size_t>(count));
+    for (int index = 0; index < count; ++index)
+    {
+      const double angle =
+          target.yaw + static_cast<double>(index) * 2.0 * pi /
+                           static_cast<double>(std::max(target.armors_num, 1));
+      const bool use_second_radius = target.armors_num == 4 && (index == 1 || index == 3);
+      const double radius = use_second_radius ? target.radius_2 : target.radius_1;
+      const double z =
+          use_second_radius ? target.position.z() + target.dz : target.position.z();
+      points.emplace_back(target.position.x() + radius * std::cos(angle),
+                          target.position.y() + radius * std::sin(angle), z);
+    }
+    return points;
+  }
+
+  static bool EstimateWorldToCamera(const TargetMessage& target,
+                                    const EkfPointsMessage& ekf,
+                                    Eigen::Matrix3d& rotation,
+                                    Eigen::Vector3d& translation)
+  {
+    std::vector<Eigen::Vector3d> world_points;
+    std::vector<Eigen::Vector3d> camera_points;
+    const auto armor_world = BuildTargetArmorWorldPoints(target);
+
+    for (int index = 0; index < static_cast<int>(armor_world.size()); ++index)
+    {
+      if (!ekf.valid[index + 1])
+      {
+        continue;
+      }
+      world_points.push_back(armor_world[static_cast<std::size_t>(index)]);
+      camera_points.push_back(ToVector(ekf.armors_cam[index]));
+    }
+
+    if (ekf.valid[0])
+    {
+      Eigen::Vector3d center(target.position.x(), target.position.y(),
+                             target.position.z());
+      if (target.armors_num == 4)
+      {
+        center.z() += target.dz * 0.5;
+      }
+      world_points.push_back(center);
+      camera_points.push_back(ToVector(ekf.center_cam));
+    }
+
+    if (world_points.size() < 3)
+    {
+      return false;
+    }
+
+    Eigen::Vector3d world_mean = Eigen::Vector3d::Zero();
+    Eigen::Vector3d camera_mean = Eigen::Vector3d::Zero();
+    for (std::size_t i = 0; i < world_points.size(); ++i)
+    {
+      world_mean += world_points[i];
+      camera_mean += camera_points[i];
+    }
+    world_mean /= static_cast<double>(world_points.size());
+    camera_mean /= static_cast<double>(camera_points.size());
+
+    Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+    for (std::size_t i = 0; i < world_points.size(); ++i)
+    {
+      covariance +=
+          (world_points[i] - world_mean) * (camera_points[i] - camera_mean).transpose();
+    }
+
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(covariance,
+                                          Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix3d v = svd.matrixV();
+    rotation = v * svd.matrixU().transpose();
+    if (rotation.determinant() < 0.0)
+    {
+      v.col(2) *= -1.0;
+      rotation = v * svd.matrixU().transpose();
+    }
+    translation = camera_mean - rotation * world_mean;
+    return true;
+  }
+
+  bool ProjectCameraPoint(const cv::Mat& canvas, const Eigen::Vector3d& point,
+                          cv::Point2d& uv) const
+  {
+    if (!(point.z() > 1e-6) || !std::isfinite(point.x()) || !std::isfinite(point.y()) ||
+        !std::isfinite(point.z()))
+    {
+      return false;
+    }
+
+    std::vector<cv::Point3d> object_points{cv::Point3d(point.x(), point.y(), point.z())};
+    cv::Mat rvec = cv::Mat::zeros(1, 3, CV_64F);
+    cv::Mat tvec = cv::Mat::zeros(1, 3, CV_64F);
+    std::vector<cv::Point2d> image_points;
+    cv::projectPoints(object_points, rvec, tvec, ScaledCameraMatrix(canvas), DistCoeffs(),
+                      image_points);
+    uv = image_points[0];
+    return uv.x >= 0.0 && uv.x < canvas.cols && uv.y >= 0.0 && uv.y < canvas.rows;
+  }
+
+  void DrawAimerTrajectory(cv::Mat& canvas, const TargetMessage& target,
+                           const EkfPointsMessage& ekf, const AimerTrajectory& trajectory)
+  {
+    if (!trajectory.valid || trajectory.point_count < 2)
+    {
+      return;
+    }
+
+    Eigen::Matrix3d rotation;
+    Eigen::Vector3d translation;
+    if (!EstimateWorldToCamera(target, ekf, rotation, translation))
+    {
+      return;
+    }
+
+    const cv::Scalar color =
+        trajectory.fire ? cv::Scalar(0, 255, 80) : cv::Scalar(0, 180, 255);
+    bool have_prev = false;
+    cv::Point2d prev;
+    const int count = std::min<int>(trajectory.point_count, AimerTrajectory::MAX_POINTS);
+    for (int index = 0; index < count; ++index)
+    {
+      const Eigen::Vector3d world = ToVector(trajectory.points[index]);
+      const Eigen::Vector3d camera = rotation * world + translation;
+      cv::Point2d uv;
+      const bool visible = ProjectCameraPoint(canvas, camera, uv);
+      if (visible && have_prev)
+      {
+        cv::line(canvas, prev, uv, color, 3, cv::LINE_AA);
+      }
+      if (visible)
+      {
+        cv::circle(canvas, uv, index == 0 ? 4 : 2, color, cv::FILLED, cv::LINE_AA);
+        prev = uv;
+        have_prev = true;
+      }
+      else
+      {
+        have_prev = false;
+      }
+    }
+
+    const Eigen::Vector3d aim_camera =
+        rotation * ToVector(trajectory.aim_point) + translation;
+    cv::Point2d aim_uv;
+    if (ProjectCameraPoint(canvas, aim_camera, aim_uv))
+    {
+      cv::drawMarker(canvas, aim_uv, color, cv::MARKER_CROSS, 24, 3, cv::LINE_AA);
+    }
+  }
+#endif
+
   cv::Mat ScaledCameraMatrix(const cv::Mat& canvas) const
   {
     const auto& k = camera_info.camera_matrix;
-    cv::Mat matrix = (cv::Mat_<double>(3, 3) << k[0], k[1], k[2], k[3], k[4],
-                      k[5], k[6], k[7], k[8]);
+    cv::Mat matrix =
+        (cv::Mat_<double>(3, 3) << k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7], k[8]);
     const double sx = static_cast<double>(canvas.cols) /
                       static_cast<double>(std::max<uint32_t>(camera_info.width, 1));
     const double sy = static_cast<double>(canvas.rows) /
@@ -821,10 +1102,8 @@ class VisionPreview : public LibXR::Application
     if (camera_info.distortion_model == CameraTypes::DistortionModel::PLUMB_BOB)
     {
       std::vector<double> coeffs = {
-          camera_info.distortion_coefficients[0],
-          camera_info.distortion_coefficients[1],
-          camera_info.distortion_coefficients[2],
-          camera_info.distortion_coefficients[3],
+          camera_info.distortion_coefficients[0], camera_info.distortion_coefficients[1],
+          camera_info.distortion_coefficients[2], camera_info.distortion_coefficients[3],
           camera_info.distortion_coefficients[4],
       };
       return cv::Mat(coeffs).reshape(1, 1).clone();
@@ -832,14 +1111,10 @@ class VisionPreview : public LibXR::Application
     if (camera_info.distortion_model == CameraTypes::DistortionModel::RATIONAL_POLYNOMIAL)
     {
       std::vector<double> coeffs = {
-          camera_info.distortion_coefficients[0],
-          camera_info.distortion_coefficients[1],
-          camera_info.distortion_coefficients[2],
-          camera_info.distortion_coefficients[3],
-          camera_info.distortion_coefficients[4],
-          camera_info.distortion_coefficients[5],
-          camera_info.distortion_coefficients[6],
-          camera_info.distortion_coefficients[7],
+          camera_info.distortion_coefficients[0], camera_info.distortion_coefficients[1],
+          camera_info.distortion_coefficients[2], camera_info.distortion_coefficients[3],
+          camera_info.distortion_coefficients[4], camera_info.distortion_coefficients[5],
+          camera_info.distortion_coefficients[6], camera_info.distortion_coefficients[7],
       };
       return cv::Mat(coeffs).reshape(1, 1).clone();
     }
@@ -858,6 +1133,14 @@ class VisionPreview : public LibXR::Application
     {
       line << " tracking=" << (snapshot.target.tracking ? 1 : 0);
     }
+#if VISION_PREVIEW_HAS_AIMER
+    if (snapshot.trajectory_valid && snapshot.trajectory.valid)
+    {
+      line << " traj=" << std::fixed << std::setprecision(3)
+           << snapshot.trajectory.fly_time_s << "s"
+           << " fire=" << (snapshot.trajectory.fire ? 1 : 0);
+    }
+#endif
     if (runtime_.overlay.candidate_debug && snapshot.candidate_valid)
     {
       line << " cand=" << static_cast<int>(snapshot.candidate.count)
@@ -866,18 +1149,14 @@ class VisionPreview : public LibXR::Application
 
     cv::rectangle(canvas, cv::Rect(0, 0, canvas.cols, 32), cv::Scalar(16, 20, 28),
                   cv::FILLED);
-    cv::putText(canvas, line.str(), cv::Point(12, 22), cv::FONT_HERSHEY_SIMPLEX,
-                0.62, cv::Scalar(230, 236, 245), 1, cv::LINE_AA);
+    cv::putText(canvas, line.str(), cv::Point(12, 22), cv::FONT_HERSHEY_SIMPLEX, 0.62,
+                cv::Scalar(230, 236, 245), 1, cv::LINE_AA);
   }
 
   void OpenRecordFiles()
   {
-    std::error_code ec;
-    std::filesystem::create_directories(output_dir_, ec);
-    if (ec)
+    if (!EnsureOutputDir())
     {
-      XR_LOG_ERROR("VisionPreview failed to create output dir: %s",
-                   output_dir_.c_str());
       return;
     }
 
@@ -886,8 +1165,15 @@ class VisionPreview : public LibXR::Application
     target_file_.open(output_dir_ + "/target.tsv", std::ios::out);
     ekf_file_.open(output_dir_ + "/ekf_points.tsv", std::ios::out);
     candidate_file_.open(output_dir_ + "/candidate_debug.tsv", std::ios::out);
+#if VISION_PREVIEW_HAS_AIMER
+    trajectory_file_.open(output_dir_ + "/aimer_trajectory.tsv", std::ios::out);
+#endif
     if (!detector_file_ || !metrics_file_ || !target_file_ || !ekf_file_ ||
-        !candidate_file_)
+        !candidate_file_
+#if VISION_PREVIEW_HAS_AIMER
+        || !trajectory_file_
+#endif
+    )
     {
       XR_LOG_ERROR("VisionPreview failed to open record files under: %s",
                    output_dir_.c_str());
@@ -904,14 +1190,29 @@ class VisionPreview : public LibXR::Application
     ekf_file_ << "image_timestamp_us\tpoint_index\tvalid\tx\ty\tz\n";
     candidate_file_ << "image_timestamp_us\tcount\tselected_index\tmatched"
                     << "\tdetection_count\ttracked_armors_num\n";
+#if VISION_PREVIEW_HAS_AIMER
+    trajectory_file_ << "image_timestamp_us\tvalid\tfire\tconverged\tpoint_index"
+                     << "\ttarget_id\tselected_armor_index\tbullet_speed"
+                     << "\tdelay_time_s\tfly_time_s\tyaw\tpitch"
+                     << "\taim_x\taim_y\taim_z\tx\ty\tz\n";
+#endif
     record_ready_ = true;
     FlushRecordFiles();
   }
 
   void WriteRawVideo(const cv::Mat& bgr)
   {
+    if (raw_writer_failed_)
+    {
+      return;
+    }
     if (!raw_writer_ready_)
     {
+      if (!EnsureOutputDir())
+      {
+        raw_writer_failed_ = true;
+        return;
+      }
       const std::string path = output_dir_ + "/" + raw_video_name_;
       const int fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
       raw_writer_ready_ = raw_writer_.open(path, fourcc, runtime_.record_fps,
@@ -919,10 +1220,38 @@ class VisionPreview : public LibXR::Application
       if (!raw_writer_ready_)
       {
         XR_LOG_ERROR("VisionPreview failed to open raw video: %s", path.c_str());
+        raw_writer_failed_ = true;
         return;
       }
     }
     raw_writer_.write(bgr);
+  }
+
+  void WriteOverlayVideo(const cv::Mat& canvas)
+  {
+    if (overlay_writer_failed_)
+    {
+      return;
+    }
+    if (!overlay_writer_ready_)
+    {
+      if (!EnsureOutputDir())
+      {
+        overlay_writer_failed_ = true;
+        return;
+      }
+      const std::string path = output_dir_ + "/" + overlay_video_name_;
+      const int fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+      overlay_writer_ready_ = overlay_writer_.open(
+          path, fourcc, runtime_.record_fps, cv::Size(canvas.cols, canvas.rows), true);
+      if (!overlay_writer_ready_)
+      {
+        XR_LOG_ERROR("VisionPreview failed to open overlay video: %s", path.c_str());
+        overlay_writer_failed_ = true;
+        return;
+      }
+    }
+    overlay_writer_.write(canvas);
   }
 
   void WriteRecords(const std::vector<DetectorMessage>& detector_records,
@@ -931,7 +1260,7 @@ class VisionPreview : public LibXR::Application
                     const std::vector<EkfPointsMessage>& ekf_records,
                     const std::vector<CandidateDebugMessage>& candidate_records)
   {
-    if (!RecordEnabled())
+    if (!RawRecordEnabled())
     {
       return;
     }
@@ -944,49 +1273,44 @@ class VisionPreview : public LibXR::Application
         detector_file_ << detector.image_timestamp_us << '\t' << i << '\t'
                        << static_cast<int>(armor.number) << '\t'
                        << static_cast<int>(armor.type) << '\t'
-                       << static_cast<int>(armor.color) << '\t'
-                       << armor.confidence << '\t' << armor.center.x << '\t'
-                       << armor.center.y << '\t' << (armor.pnp_valid ? 1 : 0)
-                       << '\t' << armor.pose.translation.x() << '\t'
-                       << armor.pose.translation.y() << '\t'
+                       << static_cast<int>(armor.color) << '\t' << armor.confidence
+                       << '\t' << armor.center.x << '\t' << armor.center.y << '\t'
+                       << (armor.pnp_valid ? 1 : 0) << '\t' << armor.pose.translation.x()
+                       << '\t' << armor.pose.translation.y() << '\t'
                        << armor.pose.translation.z() << '\n';
       }
     }
 
     for (const auto& metrics : metrics_records)
     {
-      metrics_file_ << metrics.image_timestamp_us << '\t' << metrics.frame_index
-                    << '\t' << metrics.armor_count << '\t'
-                    << metrics.decoded_count << '\t' << metrics.nms_count << '\t'
-                    << metrics.pnp_success_count << '\t'
-                    << metrics.detector_latency_ms << '\t'
-                    << metrics.publish_latency_ms << '\n';
+      metrics_file_ << metrics.image_timestamp_us << '\t' << metrics.frame_index << '\t'
+                    << metrics.armor_count << '\t' << metrics.decoded_count << '\t'
+                    << metrics.nms_count << '\t' << metrics.pnp_success_count << '\t'
+                    << metrics.detector_latency_ms << '\t' << metrics.publish_latency_ms
+                    << '\n';
     }
 
     for (const auto& target : target_records)
     {
-      target_file_ << target.image_timestamp_us << '\t'
-                   << (target.tracking ? 1 : 0) << '\t'
-                   << static_cast<int>(target.id) << '\t' << target.armors_num
-                   << '\t' << target.position.x() << '\t' << target.position.y()
-                   << '\t' << target.position.z() << '\t' << target.velocity.x()
-                   << '\t' << target.velocity.y() << '\t' << target.velocity.z()
-                   << '\t' << target.yaw << '\t' << target.v_yaw << '\t'
-                   << target.radius_1 << '\t' << target.radius_2 << '\t'
-                   << target.dz << '\n';
+      target_file_ << target.image_timestamp_us << '\t' << (target.tracking ? 1 : 0)
+                   << '\t' << static_cast<int>(target.id) << '\t' << target.armors_num
+                   << '\t' << target.position.x() << '\t' << target.position.y() << '\t'
+                   << target.position.z() << '\t' << target.velocity.x() << '\t'
+                   << target.velocity.y() << '\t' << target.velocity.z() << '\t'
+                   << target.yaw << '\t' << target.v_yaw << '\t' << target.radius_1
+                   << '\t' << target.radius_2 << '\t' << target.dz << '\n';
     }
 
     for (const auto& ekf : ekf_records)
     {
-      ekf_file_ << ekf.image_timestamp_us << "\t0\t" << (ekf.valid[0] ? 1 : 0)
-                << '\t' << ekf.center_cam.x() << '\t' << ekf.center_cam.y()
-                << '\t' << ekf.center_cam.z() << '\n';
+      ekf_file_ << ekf.image_timestamp_us << "\t0\t" << (ekf.valid[0] ? 1 : 0) << '\t'
+                << ekf.center_cam.x() << '\t' << ekf.center_cam.y() << '\t'
+                << ekf.center_cam.z() << '\n';
       for (int i = 0; i < 4; ++i)
       {
         ekf_file_ << ekf.image_timestamp_us << '\t' << (i + 1) << '\t'
-                  << (ekf.valid[i + 1] ? 1 : 0) << '\t'
-                  << ekf.armors_cam[i].x() << '\t' << ekf.armors_cam[i].y()
-                  << '\t' << ekf.armors_cam[i].z() << '\n';
+                  << (ekf.valid[i + 1] ? 1 : 0) << '\t' << ekf.armors_cam[i].x() << '\t'
+                  << ekf.armors_cam[i].y() << '\t' << ekf.armors_cam[i].z() << '\n';
       }
     }
 
@@ -1003,6 +1327,42 @@ class VisionPreview : public LibXR::Application
     FlushRecordFiles();
   }
 
+#if VISION_PREVIEW_HAS_AIMER
+  void WriteTrajectoryRecords(const std::vector<AimerTrajectory>& trajectory_records)
+  {
+    if (!RawRecordEnabled())
+    {
+      return;
+    }
+
+    for (const auto& trajectory : trajectory_records)
+    {
+      const int count =
+          std::min<int>(trajectory.point_count, AimerTrajectory::MAX_POINTS);
+      const int rows = std::max(count, 1);
+      for (int index = 0; index < rows; ++index)
+      {
+        const LibXR::Position<double> point =
+            index < count ? trajectory.points[index] : LibXR::Position<double>{};
+        trajectory_file_ << trajectory.image_timestamp_us << '\t'
+                         << (trajectory.valid ? 1 : 0) << '\t'
+                         << (trajectory.fire ? 1 : 0) << '\t'
+                         << (trajectory.converged ? 1 : 0) << '\t' << index << '\t'
+                         << static_cast<int>(trajectory.target_id) << '\t'
+                         << static_cast<int>(trajectory.selected_armor_index) << '\t'
+                         << trajectory.bullet_speed << '\t' << trajectory.delay_time_s
+                         << '\t' << trajectory.fly_time_s << '\t' << trajectory.yaw
+                         << '\t' << trajectory.pitch << '\t' << trajectory.aim_point.x()
+                         << '\t' << trajectory.aim_point.y() << '\t'
+                         << trajectory.aim_point.z() << '\t' << point.x() << '\t'
+                         << point.y() << '\t' << point.z() << '\n';
+      }
+    }
+
+    FlushRecordFiles();
+  }
+#endif
+
   void FlushRecordFiles()
   {
     detector_file_.flush();
@@ -1010,17 +1370,36 @@ class VisionPreview : public LibXR::Application
     target_file_.flush();
     ekf_file_.flush();
     candidate_file_.flush();
+#if VISION_PREVIEW_HAS_AIMER
+    trajectory_file_.flush();
+#endif
   }
 
-  bool RecordEnabled() const
+  bool EnsureOutputDir()
   {
-    return runtime_.record_raw && record_ready_;
+    if (output_dir_ready_)
+    {
+      return true;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(output_dir_, ec);
+    if (ec)
+    {
+      XR_LOG_ERROR("VisionPreview failed to create output dir: %s", output_dir_.c_str());
+      return false;
+    }
+    output_dir_ready_ = true;
+    return true;
   }
+
+  bool RawRecordEnabled() const { return runtime_.record_raw && record_ready_; }
 
   RuntimeParam runtime_{};
   std::string image_topic_name_;
   std::string output_dir_;
   std::string raw_video_name_;
+  std::string overlay_video_name_;
   std::string preview_window_name_;
 
   std::atomic<bool> running_{false};
@@ -1036,24 +1415,41 @@ class VisionPreview : public LibXR::Application
   uint32_t image_dropped_{0};
   uint32_t detector_dropped_{0};
   uint32_t tracker_dropped_{0};
+#if VISION_PREVIEW_HAS_AIMER
+  uint32_t trajectory_dropped_{0};
+#endif
 
   Ring<DetectorMessage, history_capacity> detector_history_{};
   Ring<TargetMessage, history_capacity> target_history_{};
   Ring<EkfPointsMessage, history_capacity> ekf_history_{};
   Ring<CandidateDebugMessage, history_capacity> candidate_history_{};
+#if VISION_PREVIEW_HAS_AIMER
+  Ring<AimerTrajectory, history_capacity> trajectory_history_{};
+#endif
 
   Ring<DetectorMessage, record_queue_capacity> detector_record_queue_{};
   Ring<DetectorMetrics, record_queue_capacity> metrics_record_queue_{};
   Ring<TargetMessage, record_queue_capacity> target_record_queue_{};
   Ring<EkfPointsMessage, record_queue_capacity> ekf_record_queue_{};
   Ring<CandidateDebugMessage, record_queue_capacity> candidate_record_queue_{};
+#if VISION_PREVIEW_HAS_AIMER
+  Ring<AimerTrajectory, record_queue_capacity> trajectory_record_queue_{};
+#endif
 
   std::ofstream detector_file_{};
   std::ofstream metrics_file_{};
   std::ofstream target_file_{};
   std::ofstream ekf_file_{};
   std::ofstream candidate_file_{};
+#if VISION_PREVIEW_HAS_AIMER
+  std::ofstream trajectory_file_{};
+#endif
   cv::VideoWriter raw_writer_{};
+  cv::VideoWriter overlay_writer_{};
   bool raw_writer_ready_{false};
+  bool overlay_writer_ready_{false};
+  bool raw_writer_failed_{false};
+  bool overlay_writer_failed_{false};
+  bool output_dir_ready_{false};
   bool record_ready_{false};
 };
