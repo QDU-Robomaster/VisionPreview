@@ -89,7 +89,8 @@ class VisionPreview : public LibXR::Application
   using CandidateDebugMessage = typename Tracker::CandidateDebugMsg;
 
   static inline constexpr auto camera_info = CameraInfoV;
-  static constexpr std::size_t image_queue_capacity = 2;
+  static constexpr std::size_t image_queue_capacity = 8;
+  static constexpr std::size_t realtime_preview_delay_frames = 4;
   static constexpr std::size_t history_capacity = 128;
   static constexpr std::size_t record_queue_capacity = 256;
   static constexpr std::size_t worker_stack_bytes = 256U * 1024U;
@@ -435,11 +436,36 @@ class VisionPreview : public LibXR::Application
     work_cv_.notify_one();
   }
 
-  bool PopLatestImageLocked(ImageData& out)
+  bool ImageReadyLocked() const
   {
     if (image_count_ == 0)
     {
       return false;
+    }
+    if (!realtime_preview_enabled_)
+    {
+      return true;
+    }
+    return image_count_ > realtime_preview_delay_frames;
+  }
+
+  bool PopImageLocked(ImageData& out)
+  {
+    if (image_count_ == 0)
+    {
+      return false;
+    }
+
+    if (realtime_preview_enabled_)
+    {
+      if (image_count_ <= realtime_preview_delay_frames)
+      {
+        return false;
+      }
+      out = std::move(image_queue_[image_head_]);
+      image_head_ = (image_head_ + 1U) % image_queue_capacity;
+      --image_count_;
+      return true;
     }
 
     while (image_count_ > 1)
@@ -458,7 +484,7 @@ class VisionPreview : public LibXR::Application
 
   bool HasWorkLocked() const
   {
-    return image_count_ > 0 ||
+    return ImageReadyLocked() ||
            !detector_record_queue_.Empty() ||
            !metrics_record_queue_.Empty() ||
            !target_record_queue_.Empty() ||
@@ -488,7 +514,7 @@ class VisionPreview : public LibXR::Application
           return;
         }
 
-        (void)self->PopLatestImageLocked(image);
+        (void)self->PopImageLocked(image);
         self->DrainRecordQueuesLocked(detector_records, metrics_records, target_records,
                                       ekf_records, candidate_records);
       }
