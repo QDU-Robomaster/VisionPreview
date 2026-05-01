@@ -14,6 +14,7 @@ constructor_args:
       tracker: true
       aimer_trajectory: true
       candidate_debug: false
+      model_faces: false
     output_dir: "/tmp/autoaim_preview"
     raw_video_name: "raw.avi"
     overlay_video_name: "overlay.avi"
@@ -96,6 +97,7 @@ class VisionPreview : public LibXR::Application
   using TargetMessage = SolveTrajectory::Target;
   using EkfPointsMessage = typename Tracker::EkfPointsMsg;
   using CandidateDebugMessage = typename Tracker::CandidateDebugMsg;
+  using CandidateDebugItem = typename Tracker::CandidateDebugItem;
 #if VISION_PREVIEW_HAS_AIMER
   using AimerTrajectory = Aimer::AimerTrajectory;
 #endif
@@ -114,6 +116,7 @@ class VisionPreview : public LibXR::Application
     bool tracker = true;           // 绘制 tracker EKF 中心和装甲板投影点。
     bool aimer_trajectory = true;  // 绘制 Aimer 发布的模型弹道。
     bool candidate_debug = false;  // 仅显示轻量候选统计，不画复杂候选表。
+    bool model_faces = false;      // 绘制未观测的模型补全装甲板。
   };
 
   struct RuntimeParam
@@ -723,11 +726,12 @@ class VisionPreview : public LibXR::Application
 
     if (runtime_.overlay.detector && snapshot.detector_valid)
     {
-      DrawDetector(canvas, snapshot.detector);
+      DrawDetector(canvas, snapshot.detector,
+                   snapshot.candidate_valid ? &snapshot.candidate : nullptr);
     }
     if (runtime_.overlay.tracker && snapshot.ekf_valid)
     {
-      DrawTracker(canvas, snapshot.ekf);
+      DrawTracker(canvas, snapshot);
     }
 #if VISION_PREVIEW_HAS_AIMER
     if (runtime_.overlay.aimer_trajectory && snapshot.trajectory_valid &&
@@ -844,11 +848,58 @@ class VisionPreview : public LibXR::Application
     return ARMOR_NUMBER_NAMES[index];
   }
 
-  void DrawDetector(cv::Mat& canvas, const DetectorMessage& detector)
+  static const CandidateDebugItem* SelectedCandidate(
+      const CandidateDebugMessage* candidate)
   {
-    for (const auto& armor : detector.results)
+    if (candidate == nullptr || candidate->selected_index >= candidate->count ||
+        candidate->selected_index >= CandidateDebugMessage::kMaxItems)
     {
-      const cv::Scalar color = ArmorColorToScalar(armor.color);
+      return nullptr;
+    }
+    return &candidate->items[candidate->selected_index];
+  }
+
+  static void DrawOverlayText(cv::Mat& frame, const std::string& text,
+                              const cv::Point& origin, const cv::Scalar& color,
+                              double scale = 0.58, int thickness = 2)
+  {
+    cv::putText(frame, text, origin, cv::FONT_HERSHEY_SIMPLEX, scale,
+                cv::Scalar(0, 0, 0), thickness + 2, cv::LINE_AA);
+    cv::putText(frame, text, origin, cv::FONT_HERSHEY_SIMPLEX, scale, color,
+                thickness, cv::LINE_AA);
+  }
+
+  static void DrawLabel(cv::Mat& frame, const cv::Point& origin,
+                        const std::string& text, const cv::Scalar& color)
+  {
+    int baseline = 0;
+    const cv::Size size =
+        cv::getTextSize(text, cv::FONT_HERSHEY_DUPLEX, 0.48, 1, &baseline);
+    cv::Rect bg(origin.x, std::max(0, origin.y - size.height - 8),
+                size.width + 10, size.height + 10);
+    bg &= cv::Rect(0, 0, frame.cols, frame.rows);
+    if (bg.area() <= 0)
+    {
+      return;
+    }
+    cv::rectangle(frame, bg, color, cv::FILLED, cv::LINE_AA);
+    cv::putText(frame, text, cv::Point(bg.x + 5, bg.y + size.height + 1),
+                cv::FONT_HERSHEY_DUPLEX, 0.48, cv::Scalar(12, 16, 24), 1,
+                cv::LINE_AA);
+  }
+
+  void DrawDetector(cv::Mat& canvas, const DetectorMessage& detector,
+                    const CandidateDebugMessage* candidate)
+  {
+    const auto* selected = SelectedCandidate(candidate);
+    for (std::size_t armor_index = 0; armor_index < detector.results.size();
+         ++armor_index)
+    {
+      const auto& armor = detector.results[armor_index];
+      const bool picked =
+          selected != nullptr && selected->armor_index == armor_index;
+      const cv::Scalar color = picked ? cv::Scalar(0, 255, 0)
+                                      : ArmorColorToScalar(armor.color);
       std::array<cv::Point, 4> points{};
       for (std::size_t i = 0; i < armor.points.size(); ++i)
       {
@@ -856,62 +907,315 @@ class VisionPreview : public LibXR::Application
       }
       const cv::Point* polygon = points.data();
       const int point_count = static_cast<int>(points.size());
-      cv::polylines(canvas, &polygon, &point_count, 1, true, color, 2, cv::LINE_AA);
-      cv::rectangle(canvas, armor.box, color, 1, cv::LINE_AA);
+      cv::polylines(canvas, &polygon, &point_count, 1, true, color,
+                    picked ? 3 : 2, cv::LINE_AA);
+      cv::rectangle(canvas, armor.box, color, picked ? 2 : 1, cv::LINE_AA);
+      for (const auto& point : points)
+      {
+        cv::circle(canvas, point, picked ? 4 : 3, color, cv::FILLED, cv::LINE_AA);
+      }
+      const cv::Point center(cvRound(armor.center.x), cvRound(armor.center.y));
+      cv::circle(canvas, center, picked ? 7 : 4, color, 2, cv::LINE_AA);
 
       std::ostringstream label;
-      label << ArmorNumberName(armor.number) << " " << std::fixed << std::setprecision(2)
-            << armor.confidence;
-      cv::putText(canvas, label.str(),
-                  cv::Point(std::max(armor.box.x, 4), std::max(armor.box.y - 6, 18)),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv::LINE_AA);
+      label << 'D' << armor_index;
+      if (candidate != nullptr && armor_index < candidate->detection_count &&
+          armor_index < CandidateDebugMessage::kMaxDetections &&
+          candidate->detection_track_ids[armor_index] >= 0)
+      {
+        label << " I" << candidate->detection_track_ids[armor_index];
+        if (candidate->detection_track_confirmed[armor_index] == 0)
+        {
+          label << '?';
+        }
+      }
+      if (picked)
+      {
+        label << " M F" << static_cast<int>(selected->face_index);
+      }
+      label << ' ' << ArmorNumberName(armor.number) << ' ' << std::fixed
+            << std::setprecision(2) << armor.confidence;
+      DrawLabel(canvas,
+                cv::Point(std::max(armor.box.x, 4), std::max(armor.box.y - 4, 22)),
+                label.str(), color);
     }
   }
 
-  void DrawTracker(cv::Mat& canvas, const EkfPointsMessage& ekf)
+  static Eigen::Vector3d PositionToVector(const LibXR::Position<double>& point)
   {
-    const cv::Mat camera_matrix = ScaledCameraMatrix(canvas);
-    const cv::Mat dist_coeffs = DistCoeffs();
-    auto project = [&](const LibXR::Position<double>& point, cv::Point2d& uv)
+    return Eigen::Vector3d(point.x(), point.y(), point.z());
+  }
+
+  static bool AllFinitePoints(const std::vector<cv::Point2f>& points)
+  {
+    return std::all_of(points.begin(), points.end(), [](const cv::Point2f& point)
     {
-      const Eigen::Vector3d pc(point.x(), point.y(), point.z());
-      if (!(pc.z() > 1e-6) || !std::isfinite(pc.x()) || !std::isfinite(pc.y()) ||
-          !std::isfinite(pc.z()))
+      return std::isfinite(point.x) && std::isfinite(point.y);
+    });
+  }
+
+  bool ProjectCameraPoints(const cv::Mat& camera_matrix, const cv::Mat& dist_coeffs,
+                           const cv::Size& frame_size,
+                           const std::array<Eigen::Vector3d, 4>& camera_points,
+                           std::vector<cv::Point2f>& image_points) const
+  {
+    std::vector<cv::Point3f> object_points;
+    object_points.reserve(camera_points.size());
+    for (const auto& point : camera_points)
+    {
+      if (!point.allFinite() || !(point.z() > 1e-6))
       {
         return false;
       }
-
-      std::vector<cv::Point3d> object_points{cv::Point3d(pc.x(), pc.y(), pc.z())};
-      cv::Mat rvec = cv::Mat::zeros(1, 3, CV_64F);
-      cv::Mat tvec = cv::Mat::zeros(1, 3, CV_64F);
-      std::vector<cv::Point2d> image_points;
-      cv::projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs,
-                        image_points);
-      uv = image_points[0];
-      return uv.x >= 0.0 && uv.x < canvas.cols && uv.y >= 0.0 && uv.y < canvas.rows;
-    };
-
-    cv::Point2d center_uv;
-    const bool center_visible = ekf.valid[0] && project(ekf.center_cam, center_uv);
-    if (center_visible)
-    {
-      cv::circle(canvas, center_uv, 5, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-      cv::putText(canvas, "T", center_uv + cv::Point2d(6, -6), cv::FONT_HERSHEY_SIMPLEX,
-                  0.55, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
+      object_points.emplace_back(static_cast<float>(point.x()),
+                                 static_cast<float>(point.y()),
+                                 static_cast<float>(point.z()));
     }
 
+    cv::Mat rvec = cv::Mat::zeros(3, 1, CV_64F);
+    cv::Mat tvec = cv::Mat::zeros(3, 1, CV_64F);
+    cv::projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs,
+                      image_points);
+    if (image_points.size() != camera_points.size() || !AllFinitePoints(image_points))
+    {
+      return false;
+    }
+    if (!(std::abs(cv::contourArea(image_points)) > 1.0))
+    {
+      return false;
+    }
+    return (cv::boundingRect(image_points) & cv::Rect(0, 0, frame_size.width,
+                                                     frame_size.height)).area() > 0;
+  }
+
+  bool BuildPredictedArmorQuad(const cv::Mat& camera_matrix,
+                               const cv::Mat& dist_coeffs,
+                               const cv::Size& frame_size,
+                               const Eigen::Vector3d& armor_center_cam,
+                               const Eigen::Vector3d& normal_hint_cam,
+                               ArmorType armor_type,
+                               std::vector<cv::Point2f>& image_points) const
+  {
+    if (!armor_center_cam.allFinite() || !(armor_center_cam.z() > 1e-6))
+    {
+      return false;
+    }
+
+    Eigen::Vector3d normal = normal_hint_cam;
+    if (!normal.allFinite() || !(normal.norm() > 1e-6))
+    {
+      normal = -armor_center_cam;
+    }
+    if (!normal.allFinite() || !(normal.norm() > 1e-6))
+    {
+      return false;
+    }
+    normal.normalize();
+    if (normal.dot(-armor_center_cam) < 0.0)
+    {
+      normal = -normal;
+    }
+
+    Eigen::Vector3d up(0.0, -1.0, 0.0);
+    if (std::abs(up.dot(normal)) > 0.95)
+    {
+      up = Eigen::Vector3d(1.0, 0.0, 0.0);
+    }
+    Eigen::Vector3d width_axis = up.cross(normal);
+    if (!width_axis.allFinite() || !(width_axis.norm() > 1e-6))
+    {
+      return false;
+    }
+    width_axis.normalize();
+    Eigen::Vector3d height_axis = normal.cross(width_axis);
+    if (!height_axis.allFinite() || !(height_axis.norm() > 1e-6))
+    {
+      return false;
+    }
+    height_axis.normalize();
+    if (height_axis.dot(up) < 0.0)
+    {
+      height_axis = -height_axis;
+    }
+
+    constexpr double small_armor_width_m = 0.135;
+    constexpr double large_armor_width_m = 0.230;
+    constexpr double armor_height_m = 0.056;
+    const double half_width =
+        (armor_type == ArmorType::LARGE ? large_armor_width_m : small_armor_width_m) *
+        0.5;
+    constexpr double half_height = armor_height_m * 0.5;
+    const std::array<Eigen::Vector3d, 4> corners = {
+        armor_center_cam + width_axis * half_width + height_axis * half_height,
+        armor_center_cam - width_axis * half_width + height_axis * half_height,
+        armor_center_cam - width_axis * half_width - height_axis * half_height,
+        armor_center_cam + width_axis * half_width - height_axis * half_height};
+    return ProjectCameraPoints(camera_matrix, dist_coeffs, frame_size, corners,
+                               image_points);
+  }
+
+  static ArmorType OverlayArmorType(const FrameSnapshot& snapshot)
+  {
+    if (snapshot.candidate_valid)
+    {
+      if (const auto* selected = SelectedCandidate(&snapshot.candidate);
+          selected != nullptr && selected->type != ArmorType::INVALID)
+      {
+        return selected->type;
+      }
+    }
+    if (snapshot.detector_valid)
+    {
+      for (const auto& armor : snapshot.detector.results)
+      {
+        if (armor.type != ArmorType::INVALID)
+        {
+          return armor.type;
+        }
+      }
+    }
+    return ArmorType::SMALL;
+  }
+
+  static bool DrawProjectedArmor(cv::Mat& canvas,
+                                 const std::vector<cv::Point2f>& points,
+                                 const cv::Scalar& color, int thickness,
+                                 std::string_view label, cv::Point* center_out)
+  {
+    if (!AllFinitePoints(points))
+    {
+      return false;
+    }
+    std::vector<cv::Point> polygon;
+    polygon.reserve(points.size());
+    for (const auto& point : points)
+    {
+      polygon.emplace_back(cvRound(point.x), cvRound(point.y));
+    }
+    cv::polylines(canvas, polygon, true, color, thickness, cv::LINE_AA);
+    const cv::Moments moments = cv::moments(polygon);
+    if (std::abs(moments.m00) <= 1e-6)
+    {
+      return false;
+    }
+    const cv::Point center(static_cast<int>(moments.m10 / moments.m00),
+                           static_cast<int>(moments.m01 / moments.m00));
+    if (center_out != nullptr)
+    {
+      *center_out = center;
+    }
+    cv::drawMarker(canvas, center, color, cv::MARKER_CROSS, 18, thickness,
+                   cv::LINE_AA);
+    DrawOverlayText(canvas, std::string(label), center + cv::Point(8, -8), color,
+                    0.55, 2);
+    return true;
+  }
+
+  bool ProjectTrackerPoint(const cv::Mat& camera_matrix, const cv::Mat& dist_coeffs,
+                           const cv::Size& frame_size,
+                           const LibXR::Position<double>& point,
+                           cv::Point2d& uv) const
+  {
+    const Eigen::Vector3d pc = PositionToVector(point);
+    if (!(pc.z() > 1e-6) || !pc.allFinite())
+    {
+      return false;
+    }
+
+    std::vector<cv::Point3d> object_points{cv::Point3d(pc.x(), pc.y(), pc.z())};
+    std::vector<cv::Point2d> image_points;
+    cv::projectPoints(object_points, cv::Mat::zeros(1, 3, CV_64F),
+                      cv::Mat::zeros(1, 3, CV_64F), camera_matrix, dist_coeffs,
+                      image_points);
+    uv = image_points[0];
+    return uv.x >= 0.0 && uv.x < frame_size.width && uv.y >= 0.0 &&
+           uv.y < frame_size.height;
+  }
+
+  void DrawTracker(cv::Mat& canvas, const FrameSnapshot& snapshot)
+  {
+    const auto& ekf = snapshot.ekf;
+    const cv::Mat camera_matrix = ScaledCameraMatrix(canvas);
+    const cv::Mat dist_coeffs = DistCoeffs();
+    const cv::Size frame_size(canvas.cols, canvas.rows);
+    const ArmorType armor_type = OverlayArmorType(snapshot);
+    const auto* selected =
+        snapshot.candidate_valid ? SelectedCandidate(&snapshot.candidate) : nullptr;
+
+    cv::Point2d center_uv;
+    const bool center_visible =
+        ekf.valid[0] &&
+        ProjectTrackerPoint(camera_matrix, dist_coeffs, frame_size, ekf.center_cam,
+                            center_uv);
+    if (center_visible)
+    {
+      const cv::Point center(cvRound(center_uv.x), cvRound(center_uv.y));
+      cv::circle(canvas, center, 6, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+      DrawOverlayText(canvas, "TC", center + cv::Point(8, -8),
+                      cv::Scalar(0, 255, 0), 0.58, 2);
+    }
+
+    bool have_measured_center = false;
+    cv::Point measured_center;
+    if (snapshot.detector_valid && selected != nullptr &&
+        selected->armor_index < snapshot.detector.results.size())
+    {
+      const auto& armor = snapshot.detector.results[selected->armor_index];
+      measured_center = cv::Point(cvRound(armor.center.x), cvRound(armor.center.y));
+      have_measured_center = true;
+      cv::drawMarker(canvas, measured_center, cv::Scalar(0, 255, 0),
+                     cv::MARKER_TILTED_CROSS, 18, 2, cv::LINE_AA);
+      DrawOverlayText(canvas, "M", measured_center + cv::Point(8, 18),
+                      cv::Scalar(0, 255, 0), 0.58, 2);
+    }
+
+    const Eigen::Vector3d center_cam = PositionToVector(ekf.center_cam);
+    const bool center_cam_valid = ekf.valid[0] && center_cam.allFinite();
     for (int i = 0; i < std::min<int>(ekf.count, 4); ++i)
     {
-      cv::Point2d armor_uv;
-      if (!ekf.valid[i + 1] || !project(ekf.armors_cam[i], armor_uv))
+      const bool selected_face =
+          selected != nullptr && static_cast<int>(selected->face_index) == i;
+      if (!selected_face && !runtime_.overlay.model_faces)
+      {
+        continue;
+      }
+      if (!ekf.valid[i + 1])
       {
         continue;
       }
 
-      cv::circle(canvas, armor_uv, 4, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+      const Eigen::Vector3d armor_center = PositionToVector(ekf.armors_cam[i]);
+      Eigen::Vector3d normal_hint = -armor_center;
+      if (center_cam_valid)
+      {
+        normal_hint = armor_center - center_cam;
+      }
+      std::vector<cv::Point2f> points;
+      if (!BuildPredictedArmorQuad(camera_matrix, dist_coeffs, frame_size,
+                                   armor_center, normal_hint, armor_type, points))
+      {
+        continue;
+      }
+
+      cv::Point projected_center;
+      const cv::Scalar color =
+          selected_face ? cv::Scalar(255, 0, 255) : cv::Scalar(170, 180, 40);
+      std::ostringstream label;
+      label << (selected_face ? "EF" : "F") << i;
+      if (!DrawProjectedArmor(canvas, points, color, selected_face ? 3 : 1,
+                              label.str(), &projected_center))
+      {
+        continue;
+      }
       if (center_visible)
       {
-        cv::line(canvas, center_uv, armor_uv, cv::Scalar(80, 180, 255), 1, cv::LINE_AA);
+        cv::line(canvas, cv::Point(cvRound(center_uv.x), cvRound(center_uv.y)),
+                 projected_center, cv::Scalar(80, 180, 255), 1, cv::LINE_AA);
+      }
+      if (selected_face && have_measured_center)
+      {
+        cv::line(canvas, measured_center, projected_center,
+                 cv::Scalar(0, 220, 255), 2, cv::LINE_AA);
       }
     }
   }
