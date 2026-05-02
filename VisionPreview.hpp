@@ -1098,6 +1098,12 @@ class VisionPreview : public LibXR::Application
     return uv.x >= 0.0 && uv.x < canvas.cols && uv.y >= 0.0 && uv.y < canvas.rows;
   }
 
+  cv::Point2d OverlayPrincipalPoint(const cv::Mat& canvas) const
+  {
+    const cv::Mat camera_matrix = ScaledCameraMatrix(canvas);
+    return cv::Point2d(camera_matrix.at<double>(0, 2), camera_matrix.at<double>(1, 2));
+  }
+
   void DrawAimerTrajectory(cv::Mat& canvas, const TargetMessage& target,
                            const EkfPointsMessage& ekf, const AimerTrajectory& trajectory)
   {
@@ -1116,8 +1122,16 @@ class VisionPreview : public LibXR::Application
     const cv::Scalar color =
         trajectory.fire ? cv::Scalar(0, 255, 80) : cv::Scalar(0, 96, 255);
     const cv::Scalar shadow(0, 0, 0);
-    bool have_prev_visible = false;
-    cv::Point2d prev;
+    const cv::Point2d launch_uv = OverlayPrincipalPoint(canvas);
+    bool have_prev_visible = InCanvas(canvas, launch_uv);
+    cv::Point2d prev = launch_uv;
+    if (have_prev_visible)
+    {
+      cv::circle(canvas, launch_uv, 5, shadow, cv::FILLED, cv::LINE_AA);
+      cv::circle(canvas, launch_uv, 3, color, cv::FILLED, cv::LINE_AA);
+    }
+
+    bool path_started = false;
     const int count = std::min<int>(trajectory.point_count, AimerTrajectory::MAX_POINTS);
     for (int index = 0; index < count; ++index)
     {
@@ -1135,6 +1149,7 @@ class VisionPreview : public LibXR::Application
       {
         prev = uv;
         have_prev_visible = true;
+        path_started = true;
         if (index == 1 || index == count - 1 || (index % 4) == 0)
         {
           cv::circle(canvas, uv, index == 1 ? 4 : 3, shadow, cv::FILLED, cv::LINE_AA);
@@ -1143,7 +1158,10 @@ class VisionPreview : public LibXR::Application
       }
       else
       {
-        have_prev_visible = false;
+        if (path_started)
+        {
+          have_prev_visible = false;
+        }
       }
     }
 
