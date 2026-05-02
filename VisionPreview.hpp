@@ -1025,6 +1025,13 @@ class VisionPreview : public LibXR::Application
   bool ProjectCameraPoint(const cv::Mat& canvas, const Eigen::Vector3d& point,
                           cv::Point2d& uv) const
   {
+    return ProjectCameraPointUnclipped(canvas, point, uv) && InCanvas(canvas, uv);
+  }
+
+  bool ProjectCameraPointUnclipped(const cv::Mat& canvas,
+                                   const Eigen::Vector3d& point,
+                                   cv::Point2d& uv) const
+  {
     if (!(point.z() > 1e-6) || !std::isfinite(point.x()) || !std::isfinite(point.y()) ||
         !std::isfinite(point.z()))
     {
@@ -1037,8 +1044,30 @@ class VisionPreview : public LibXR::Application
     std::vector<cv::Point2d> image_points;
     cv::projectPoints(object_points, rvec, tvec, ScaledCameraMatrix(canvas), DistCoeffs(),
                       image_points);
+    if (image_points.empty() || !std::isfinite(image_points[0].x) ||
+        !std::isfinite(image_points[0].y))
+    {
+      return false;
+    }
     uv = image_points[0];
+    return true;
+  }
+
+  static bool InCanvas(const cv::Mat& canvas, const cv::Point2d& uv)
+  {
     return uv.x >= 0.0 && uv.x < canvas.cols && uv.y >= 0.0 && uv.y < canvas.rows;
+  }
+
+  static void DrawClippedLine(cv::Mat& canvas, const cv::Point2d& a,
+                              const cv::Point2d& b, const cv::Scalar& color,
+                              int thickness)
+  {
+    cv::Point p0(cvRound(a.x), cvRound(a.y));
+    cv::Point p1(cvRound(b.x), cvRound(b.y));
+    if (cv::clipLine(cv::Size(canvas.cols, canvas.rows), p0, p1))
+    {
+      cv::line(canvas, p0, p1, color, thickness, cv::LINE_AA);
+    }
   }
 
   void DrawAimerTrajectory(cv::Mat& canvas, const TargetMessage& target,
@@ -1057,7 +1086,8 @@ class VisionPreview : public LibXR::Application
     }
 
     const cv::Scalar color =
-        trajectory.fire ? cv::Scalar(0, 255, 80) : cv::Scalar(0, 180, 255);
+        trajectory.fire ? cv::Scalar(0, 255, 80) : cv::Scalar(0, 96, 255);
+    const cv::Scalar shadow(0, 0, 0);
     bool have_prev = false;
     cv::Point2d prev;
     const int count = std::min<int>(trajectory.point_count, AimerTrajectory::MAX_POINTS);
@@ -1066,16 +1096,21 @@ class VisionPreview : public LibXR::Application
       const Eigen::Vector3d world = ToVector(trajectory.points[index]);
       const Eigen::Vector3d camera = rotation * world + translation;
       cv::Point2d uv;
-      const bool visible = ProjectCameraPoint(canvas, camera, uv);
-      if (visible && have_prev)
+      const bool projectable = ProjectCameraPointUnclipped(canvas, camera, uv);
+      if (projectable && have_prev)
       {
-        cv::line(canvas, prev, uv, color, 3, cv::LINE_AA);
+        DrawClippedLine(canvas, prev, uv, shadow, 7);
+        DrawClippedLine(canvas, prev, uv, color, 4);
       }
-      if (visible)
+      if (projectable)
       {
-        cv::circle(canvas, uv, index == 0 ? 4 : 2, color, cv::FILLED, cv::LINE_AA);
         prev = uv;
         have_prev = true;
+        if (InCanvas(canvas, uv) && (index == 1 || index == count - 1 || (index % 4) == 0))
+        {
+          cv::circle(canvas, uv, index == 1 ? 4 : 3, shadow, cv::FILLED, cv::LINE_AA);
+          cv::circle(canvas, uv, index == 1 ? 3 : 2, color, cv::FILLED, cv::LINE_AA);
+        }
       }
       else
       {
@@ -1086,9 +1121,12 @@ class VisionPreview : public LibXR::Application
     const Eigen::Vector3d aim_camera =
         rotation * ToVector(trajectory.aim_point) + translation;
     cv::Point2d aim_uv;
-    if (ProjectCameraPoint(canvas, aim_camera, aim_uv))
+    if (ProjectCameraPointUnclipped(canvas, aim_camera, aim_uv) && InCanvas(canvas, aim_uv))
     {
-      cv::drawMarker(canvas, aim_uv, color, cv::MARKER_CROSS, 24, 3, cv::LINE_AA);
+      cv::drawMarker(canvas, aim_uv, shadow, cv::MARKER_CROSS, 20, 5, cv::LINE_AA);
+      cv::drawMarker(canvas, aim_uv, color, cv::MARKER_CROSS, 18, 2, cv::LINE_AA);
+      cv::circle(canvas, aim_uv, 4, shadow, 2, cv::LINE_AA);
+      cv::circle(canvas, aim_uv, 3, color, 1, cv::LINE_AA);
     }
   }
 #endif
