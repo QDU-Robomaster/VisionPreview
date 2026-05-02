@@ -90,7 +90,8 @@ class VisionPreview : public LibXR::Application
   using ImageFrame = typename Sync::ImageFrame;
   using ImageTopic = typename Sync::ImageTopic;
   using ImageData = typename Sync::ImageData;
-  using DetectorMessage = ArmorDetectionsMessage;
+  using DetectorMessage = ArmorDetectionsPacket;
+  using DetectorTopicMessage = ArmorDetectionsMessage;
   using DetectorMetrics = ArmorDetectorMetrics;
   using Tracker = ArmorTracker<CameraInfoV>;
   using TargetMessage = SolveTrajectory::Target;
@@ -328,8 +329,11 @@ class VisionPreview : public LibXR::Application
     auto detector_callback = LibXR::Topic::Callback::Create(
         [](bool, Self* self, LibXR::RawData& data)
         {
-          const auto* message = reinterpret_cast<const DetectorMessage*>(data.addr_);
-          self->PushDetector(*message);
+          auto* message = reinterpret_cast<DetectorTopicMessage*>(data.addr_);
+          if (message != nullptr && *message != nullptr)
+          {
+            self->PushDetector(**message);
+          }
         },
         this);
     detector_topic.RegisterCallback(detector_callback);
