@@ -1123,40 +1123,27 @@ class VisionPreview : public LibXR::Application
         trajectory.fire ? cv::Scalar(0, 255, 80) : cv::Scalar(0, 96, 255);
     const cv::Scalar shadow(0, 0, 0);
     const cv::Point2d launch_uv = OverlayPrincipalPoint(canvas);
-    const Eigen::Vector3d aim_camera =
-        rotation * ToVector(trajectory.aim_point) + translation;
-    const double min_stable_depth =
-        aim_camera.z() > 1e-6 && std::isfinite(aim_camera.z())
-            ? std::clamp(aim_camera.z() * 0.12, 0.45, 0.90)
-            : 0.45;
+    // Aimer trajectory samples live in the launch/world frame. They describe the
+    // ballistic direction field from the fire-control origin, not near-field
+    // objects that should be translated by the camera baseline. Applying the
+    // camera translation makes the samples around the muzzle pass through the
+    // pinhole singularity and can fold a planar parabola into a false loop.
+    const Eigen::Vector3d aim_camera = rotation * ToVector(trajectory.aim_point);
 
-    bool have_prev_visible = InCanvas(canvas, launch_uv);
-    cv::Point2d prev = launch_uv;
-    if (have_prev_visible)
-    {
-      cv::circle(canvas, launch_uv, 5, shadow, cv::FILLED, cv::LINE_AA);
-      cv::circle(canvas, launch_uv, 3, color, cv::FILLED, cv::LINE_AA);
-    }
-
+    bool have_prev_visible = false;
+    cv::Point2d prev;
     bool path_started = false;
     const int count = std::min<int>(trajectory.point_count, AimerTrajectory::MAX_POINTS);
     for (int index = 1; index < count; ++index)
     {
       const Eigen::Vector3d trajectory_world = ToVector(trajectory.points[index]);
-      const Eigen::Vector3d camera = rotation * trajectory_world + translation;
-      // Aimer samples start at the gun/camera origin. Near that origin the pinhole
-      // projection is singular, so those samples are not meaningful overlay points.
-      if (camera.z() < min_stable_depth)
-      {
-        continue;
-      }
+      const Eigen::Vector3d camera = rotation * trajectory_world;
       cv::Point2d uv;
-      const bool projectable = ProjectCameraPointUnclipped(canvas, camera, uv);
-      const bool visible = projectable && InCanvas(canvas, uv);
+      const bool visible = ProjectCameraPoint(canvas, camera, uv);
       if (visible && have_prev_visible)
       {
-        cv::line(canvas, prev, uv, shadow, 7, cv::LINE_AA);
-        cv::line(canvas, prev, uv, color, 4, cv::LINE_AA);
+        cv::line(canvas, prev, uv, shadow, 4, cv::LINE_AA);
+        cv::line(canvas, prev, uv, color, 2, cv::LINE_AA);
       }
       if (visible)
       {
@@ -1166,18 +1153,15 @@ class VisionPreview : public LibXR::Application
         path_started = true;
         if (first_path_point || index == count - 1 || (index % 4) == 0)
         {
-          cv::circle(canvas, uv, first_path_point ? 4 : 3, shadow, cv::FILLED,
+          cv::circle(canvas, uv, first_path_point ? 3 : 2, shadow, cv::FILLED,
                      cv::LINE_AA);
-          cv::circle(canvas, uv, first_path_point ? 3 : 2, color, cv::FILLED,
+          cv::circle(canvas, uv, first_path_point ? 2 : 1, color, cv::FILLED,
                      cv::LINE_AA);
         }
       }
       else
       {
-        if (path_started)
-        {
-          have_prev_visible = false;
-        }
+        have_prev_visible = false;
       }
     }
 
