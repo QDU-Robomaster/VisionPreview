@@ -8,6 +8,7 @@ constructor_args:
     enabled: false
     record_raw: false
     record_overlay: false
+    record_topics: false
     realtime_preview: false
     overlay:
       detector: true
@@ -122,6 +123,7 @@ class VisionPreview : public LibXR::Application
     bool enabled = false;           // 总开关；关闭时不注册回调、不启动线程。
     bool record_raw = false;        // 原始视频和 topic 数据落盘。
     bool record_overlay = false;    // 直接写 overlay 后的视频，不依赖窗口录屏。
+    bool record_topics = false;     // 只记录 topic TSV，不写视频；用于低扰动评估。
     bool realtime_preview = false;  // 实时窗口预览。
     OverlayConfig overlay{};
     std::string_view output_dir = "/tmp/autoaim_preview";
@@ -154,13 +156,13 @@ class VisionPreview : public LibXR::Application
     {
       XR_LOG_WARN("VisionPreview realtime preview disabled: display backend unavailable");
     }
-    if (!runtime_.record_raw && !runtime_.record_overlay && !realtime_preview_enabled_)
+    if (!RecordFilesRequested() && !realtime_preview_enabled_)
     {
       XR_LOG_INFO("VisionPreview disabled: no available output");
       return;
     }
 
-    if (runtime_.record_raw)
+    if (RecordFilesRequested())
     {
       OpenRecordFiles();
       if (!record_ready_ && !realtime_preview_enabled_)
@@ -313,12 +315,18 @@ class VisionPreview : public LibXR::Application
   bool ShouldRun() const
   {
     return runtime_.enabled &&
-           (runtime_.record_raw || runtime_.record_overlay || runtime_.realtime_preview);
+           (runtime_.record_raw || runtime_.record_overlay ||
+            runtime_.record_topics || runtime_.realtime_preview);
   }
 
   bool OverlayOutputEnabled() const
   {
     return runtime_.record_overlay || realtime_preview_enabled_;
+  }
+
+  bool RecordFilesRequested() const
+  {
+    return runtime_.record_raw || runtime_.record_overlay || runtime_.record_topics;
   }
 
   void RegisterCallbacks()
@@ -404,7 +412,7 @@ class VisionPreview : public LibXR::Application
     // topic 回调只拷贝消息并入队，绘制和文件写入都放到 worker 线程。
     std::lock_guard<std::mutex> lock(mutex_);
     detector_history_.Push(message);
-    if (RawRecordEnabled())
+    if (RecordFilesEnabled())
     {
       detector_record_queue_.Push(message);
       detector_dropped_ = detector_record_queue_.dropped;
@@ -416,7 +424,7 @@ class VisionPreview : public LibXR::Application
   {
     // metrics 不参与 overlay 对齐，只在落盘模式下排队写出。
     std::lock_guard<std::mutex> lock(mutex_);
-    if (RawRecordEnabled())
+    if (RecordFilesEnabled())
     {
       metrics_record_queue_.Push(message);
     }
@@ -427,7 +435,7 @@ class VisionPreview : public LibXR::Application
   {
     std::lock_guard<std::mutex> lock(mutex_);
     target_history_.Push(message);
-    if (RawRecordEnabled())
+    if (RecordFilesEnabled())
     {
       target_record_queue_.Push(message);
       tracker_dropped_ = target_record_queue_.dropped;
@@ -439,7 +447,7 @@ class VisionPreview : public LibXR::Application
   {
     std::lock_guard<std::mutex> lock(mutex_);
     ekf_history_.Push(message);
-    if (RawRecordEnabled())
+    if (RecordFilesEnabled())
     {
       ekf_record_queue_.Push(message);
     }
@@ -450,7 +458,7 @@ class VisionPreview : public LibXR::Application
   {
     std::lock_guard<std::mutex> lock(mutex_);
     candidate_history_.Push(message);
-    if (RawRecordEnabled())
+    if (RecordFilesEnabled())
     {
       candidate_record_queue_.Push(message);
     }
@@ -462,7 +470,7 @@ class VisionPreview : public LibXR::Application
   {
     std::lock_guard<std::mutex> lock(mutex_);
     trajectory_history_.Push(message);
-    if (RawRecordEnabled())
+    if (RecordFilesEnabled())
     {
       trajectory_record_queue_.Push(message);
       trajectory_dropped_ = trajectory_record_queue_.dropped;
@@ -711,7 +719,7 @@ class VisionPreview : public LibXR::Application
       return;
     }
 
-    if (RawRecordEnabled())
+    if (RawVideoEnabled())
     {
       WriteRawVideo(bgr);
     }
@@ -1264,7 +1272,7 @@ class VisionPreview : public LibXR::Application
                     const std::vector<EkfPointsMessage>& ekf_records,
                     const std::vector<CandidateDebugMessage>& candidate_records)
   {
-    if (!RawRecordEnabled())
+    if (!RecordFilesEnabled())
     {
       return;
     }
@@ -1334,7 +1342,7 @@ class VisionPreview : public LibXR::Application
 #if VISION_PREVIEW_HAS_AIMER
   void WriteTrajectoryRecords(const std::vector<AimerTrajectory>& trajectory_records)
   {
-    if (!RawRecordEnabled())
+    if (!RecordFilesEnabled())
     {
       return;
     }
@@ -1397,7 +1405,8 @@ class VisionPreview : public LibXR::Application
     return true;
   }
 
-  bool RawRecordEnabled() const { return runtime_.record_raw && record_ready_; }
+  bool RecordFilesEnabled() const { return RecordFilesRequested() && record_ready_; }
+  bool RawVideoEnabled() const { return runtime_.record_raw && record_ready_; }
 
   RuntimeParam runtime_{};
   std::string image_topic_name_;
