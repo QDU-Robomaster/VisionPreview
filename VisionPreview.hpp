@@ -1098,18 +1098,6 @@ class VisionPreview : public LibXR::Application
     return uv.x >= 0.0 && uv.x < canvas.cols && uv.y >= 0.0 && uv.y < canvas.rows;
   }
 
-  static void DrawClippedLine(cv::Mat& canvas, const cv::Point2d& a,
-                              const cv::Point2d& b, const cv::Scalar& color,
-                              int thickness)
-  {
-    cv::Point p0(cvRound(a.x), cvRound(a.y));
-    cv::Point p1(cvRound(b.x), cvRound(b.y));
-    if (cv::clipLine(cv::Size(canvas.cols, canvas.rows), p0, p1))
-    {
-      cv::line(canvas, p0, p1, color, thickness, cv::LINE_AA);
-    }
-  }
-
   void DrawAimerTrajectory(cv::Mat& canvas, const TargetMessage& target,
                            const EkfPointsMessage& ekf, const AimerTrajectory& trajectory)
   {
@@ -1128,7 +1116,7 @@ class VisionPreview : public LibXR::Application
     const cv::Scalar color =
         trajectory.fire ? cv::Scalar(0, 255, 80) : cv::Scalar(0, 96, 255);
     const cv::Scalar shadow(0, 0, 0);
-    bool have_prev = false;
+    bool have_prev_visible = false;
     cv::Point2d prev;
     const int count = std::min<int>(trajectory.point_count, AimerTrajectory::MAX_POINTS);
     for (int index = 0; index < count; ++index)
@@ -1137,16 +1125,17 @@ class VisionPreview : public LibXR::Application
       const Eigen::Vector3d camera = rotation * world + translation;
       cv::Point2d uv;
       const bool projectable = ProjectCameraPointUnclipped(canvas, camera, uv);
-      if (projectable && have_prev)
+      const bool visible = projectable && InCanvas(canvas, uv);
+      if (visible && have_prev_visible)
       {
-        DrawClippedLine(canvas, prev, uv, shadow, 7);
-        DrawClippedLine(canvas, prev, uv, color, 4);
+        cv::line(canvas, prev, uv, shadow, 7, cv::LINE_AA);
+        cv::line(canvas, prev, uv, color, 4, cv::LINE_AA);
       }
-      if (projectable)
+      if (visible)
       {
         prev = uv;
-        have_prev = true;
-        if (InCanvas(canvas, uv) && (index == 1 || index == count - 1 || (index % 4) == 0))
+        have_prev_visible = true;
+        if (index == 1 || index == count - 1 || (index % 4) == 0)
         {
           cv::circle(canvas, uv, index == 1 ? 4 : 3, shadow, cv::FILLED, cv::LINE_AA);
           cv::circle(canvas, uv, index == 1 ? 3 : 2, color, cv::FILLED, cv::LINE_AA);
@@ -1154,7 +1143,7 @@ class VisionPreview : public LibXR::Application
       }
       else
       {
-        have_prev = false;
+        have_prev_visible = false;
       }
     }
 
