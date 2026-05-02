@@ -22,6 +22,8 @@ constructor_args:
     preview_scale: 0.5
     preview_wait_key_ms: 1
     record_fps: 100.0
+    overlay_width: 0
+    overlay_height: 0
   sync: '@camera_frame_sync'
 template_args:
   - Info:
@@ -133,6 +135,8 @@ class VisionPreview : public LibXR::Application
     double preview_scale = 0.5;
     int preview_wait_key_ms = 1;
     double record_fps = 100.0;
+    uint32_t overlay_width = 0;
+    uint32_t overlay_height = 0;
   };
 
   VisionPreview(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
@@ -731,7 +735,21 @@ class VisionPreview : public LibXR::Application
 
     const uint64_t timestamp_us = static_cast<uint64_t>(image_frame->timestamp_us);
     FrameSnapshot snapshot = SnapshotFor(timestamp_us);
-    cv::Mat canvas = bgr.clone();
+    cv::Mat canvas = bgr;
+    if (runtime_.overlay_width > 0 && runtime_.overlay_height > 0 &&
+        (canvas.cols != static_cast<int>(runtime_.overlay_width) ||
+         canvas.rows != static_cast<int>(runtime_.overlay_height)))
+    {
+      cv::Mat resized;
+      cv::resize(bgr, resized, cv::Size(static_cast<int>(runtime_.overlay_width),
+                                        static_cast<int>(runtime_.overlay_height)),
+                 0.0, 0.0, cv::INTER_LINEAR);
+      canvas = std::move(resized);
+    }
+    else
+    {
+      canvas = bgr.clone();
+    }
 
     if (runtime_.overlay.detector && snapshot.detector_valid)
     {
@@ -846,6 +864,26 @@ class VisionPreview : public LibXR::Application
     }
   }
 
+  cv::Point ScaleImagePoint(const cv::Point2d& point, const cv::Size& canvas_size) const
+  {
+    const double sx = static_cast<double>(canvas_size.width) /
+                      static_cast<double>(std::max<uint32_t>(camera_info.width, 1));
+    const double sy = static_cast<double>(canvas_size.height) /
+                      static_cast<double>(std::max<uint32_t>(camera_info.height, 1));
+    return cv::Point(cvRound(point.x * sx), cvRound(point.y * sy));
+  }
+
+  cv::Rect ScaleImageRect(const cv::Rect& rect, const cv::Size& canvas_size) const
+  {
+    const double sx = static_cast<double>(canvas_size.width) /
+                      static_cast<double>(std::max<uint32_t>(camera_info.width, 1));
+    const double sy = static_cast<double>(canvas_size.height) /
+                      static_cast<double>(std::max<uint32_t>(camera_info.height, 1));
+    return cv::Rect(cvRound(rect.x * sx), cvRound(rect.y * sy),
+                    std::max(1, cvRound(rect.width * sx)),
+                    std::max(1, cvRound(rect.height * sy)));
+  }
+
   static std::string_view ArmorNumberName(ArmorNumber number)
   {
     const std::size_t index = static_cast<std::size_t>(number);
@@ -864,18 +902,20 @@ class VisionPreview : public LibXR::Application
       std::array<cv::Point, 4> points{};
       for (std::size_t i = 0; i < armor.points.size(); ++i)
       {
-        points[i] = cv::Point(cvRound(armor.points[i].x), cvRound(armor.points[i].y));
+        points[i] = ScaleImagePoint(armor.points[i], canvas.size());
       }
       const cv::Point* polygon = points.data();
       const int point_count = static_cast<int>(points.size());
       cv::polylines(canvas, &polygon, &point_count, 1, true, color, 2, cv::LINE_AA);
-      cv::rectangle(canvas, armor.box, color, 1, cv::LINE_AA);
+      cv::rectangle(canvas, ScaleImageRect(armor.box, canvas.size()), color, 1,
+                    cv::LINE_AA);
 
       std::ostringstream label;
       label << ArmorNumberName(armor.number) << " " << std::fixed << std::setprecision(2)
             << armor.confidence;
+      const cv::Rect scaled_box = ScaleImageRect(armor.box, canvas.size());
       cv::putText(canvas, label.str(),
-                  cv::Point(std::max(armor.box.x, 4), std::max(armor.box.y - 6, 18)),
+                  cv::Point(std::max(scaled_box.x, 4), std::max(scaled_box.y - 6, 18)),
                   cv::FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv::LINE_AA);
     }
   }
