@@ -76,7 +76,7 @@ depends:
 #include "ArmorTracker.hpp"
 #include "CameraFrameSync.hpp"
 #include "app_framework.hpp"
-#include "armor.hpp"
+#include "ArmorDetectorTypes.hpp"
 #include "libxr.hpp"
 #include "linux_shared_topic.hpp"
 #include "logger.hpp"
