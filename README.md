@@ -1,26 +1,29 @@
 # VisionPreview
 
-`VisionPreview` 是视觉链路的统一预览与落盘模块。算法模块只发布 topic，不再直接创建窗口、绘制 overlay 或写视频。
+`VisionPreview` 是只负责实时预览的轻量工具。
 
-## 数据输入
+它不订阅 topic，不做录像，不写 TSV，也不关心 detector/tracker 的消息类型。需要实时预览的模块直接组合它，在自己的线程里调用 `Submit(frame, draw_callback)`。
 
-- 图像：订阅 `CameraFrameSync` 暴露的共享图像 topic。
-- 检测：订阅 `armor_detector/armors_result` 和 `armor_detector/metrics`。
-- 跟踪：订阅 `tracker/target`、`tracker/ekf_points`、`tracker/candidate_debug`。
-- 弹道：如果编译时存在 `Aimer.hpp`，额外订阅 `aimer/trajectory`。
+`enabled` 是唯一运行开关：`false` 时不启动线程，`Submit()` 直接返回 `false`；`true` 时启动 OpenCV 窗口预览。`Submit()` 会在调用线程里深拷贝输入图像，然后立即返回。预览线程拿到这份拷贝后执行 `draw_callback(cv::Mat&)` 绘制 overlay，再调用 `imshow/waitKey` 显示。预览线程处理不过来时丢旧帧，不反压 detector、tracker 或相机同步线程。
 
-所有 overlay 都按 `image_timestamp_us` 对齐。图像队列只保留最新帧，预览线程处理不过来时丢旧图，不反压 detector/tracker。
-弹道 overlay 使用同帧 `tracker/target` 和 `tracker/ekf_points` 估计 `world -> camera`，只负责投影 Aimer 发布的模型弹道，不在预览模块里重新解算弹道。`record_overlay` 会直接输出带 overlay 的视频文件，不需要桌面录屏。
+配置项：
 
-## 配置开关
+- `enabled`：实时预览总开关。
+- `preview_window_name`：OpenCV 窗口名。
+- `preview_scale`：显示缩放比例，只影响窗口画面。
+- `preview_wait_key_ms`：OpenCV 窗口事件轮询时间，单位 ms。
+- `queue_capacity`：预览任务队列长度，队列满时丢弃旧帧。
 
-- `enabled`：总开关。
-- `record_raw`：写原始视频和 topic 数据 TSV。
-- `record_overlay`：直接写带 overlay 的视频文件。
-- `realtime_preview`：打开实时窗口。
-- `overlay.detector`：绘制 detector 框、角点和置信度。
-- `overlay.tracker`：绘制 tracker EKF 中心和装甲板点。
-- `overlay.aimer_trajectory`：绘制 Aimer 的模型弹道曲线和命中点。
-- `overlay.candidate_debug`：显示候选统计。
+最小用法：
 
-关闭 `record_raw`、`record_overlay` 和 `realtime_preview` 时，模块不会启动线程或注册回调。
+```cpp
+VisionPreview preview({
+    .enabled = true,
+    .preview_window_name = "detector_preview",
+    .preview_scale = 0.5,
+});
+
+preview.Submit(frame, [result](cv::Mat& canvas) {
+  // 在预览线程里绘制 overlay。
+});
+```
