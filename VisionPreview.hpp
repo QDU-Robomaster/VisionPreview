@@ -78,7 +78,7 @@ depends:
 #include "ArmorTracker.hpp"
 #include "CameraFrameSync.hpp"
 #include "app_framework.hpp"
-#include "armor.hpp"
+#include "ArmorDetectorTypes.hpp"
 #include "libxr.hpp"
 #include "linux_shared_topic.hpp"
 #include "logger.hpp"
@@ -1284,7 +1284,7 @@ class VisionPreview : public LibXR::Application
     detector_file_ << "image_timestamp_us\tarmor_index\tnumber\ttype\tcolor\tconfidence"
                    << "\tcenter_x\tcenter_y\tpnp_valid\tpose_x\tpose_y\tpose_z\n";
     metrics_file_ << "image_timestamp_us\tframe_index\tarmor_count\tdecoded_count"
-                  << "\tnms_count\tpnp_success_count\tdetector_latency_ms"
+                  << "\toverlap_kept_count\tpnp_success_count\tdetector_latency_ms"
                   << "\tpublish_latency_ms\n";
     target_file_ << "image_timestamp_us\ttracking\tid\tarmors_num\tpos_x\tpos_y\tpos_z"
                  << "\tvel_x\tvel_y\tvel_z\tyaw\tv_yaw\tradius_1\tradius_2\tdz\n";
@@ -1386,7 +1386,7 @@ class VisionPreview : public LibXR::Application
     {
       metrics_file_ << metrics.image_timestamp_us << '\t' << metrics.frame_index << '\t'
                     << metrics.armor_count << '\t' << metrics.decoded_count << '\t'
-                    << metrics.nms_count << '\t' << metrics.pnp_success_count << '\t'
+                    << metrics.overlap_kept_count << '\t' << metrics.pnp_success_count << '\t'
                     << metrics.detector_latency_ms << '\t' << metrics.publish_latency_ms
                     << '\n';
     }
