@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -56,6 +57,8 @@ class VisionPreview
     uint16_t web_port = 8080;
     // Web 路由名；为空时用 preview_window_name 生成，例如 /stream/armor_detector_preview。
     std::string_view web_stream_name = "";
+    // 预览最大接受帧率；<= 0 表示不限频。限频在 Submit() 入口执行，未到间隔时不拷贝图像。
+    double max_fps = 30.0;
   };
 
   using DrawCallback = std::function<void(cv::Mat&)>;
@@ -81,6 +84,9 @@ class VisionPreview
         runtime.web_stream_name.empty() ? runtime.preview_window_name
                                         : runtime.web_stream_name);
     dropped_frames_.store(0, std::memory_order_relaxed);
+    rate_dropped_frames_.store(0, std::memory_order_relaxed);
+    accepted_frames_.store(0, std::memory_order_relaxed);
+    ConfigureRateLimit(runtime.max_fps);
     if (!ShouldRun())
     {
       return false;
@@ -112,9 +118,10 @@ class VisionPreview
       return false;
     }
     worker_thread_ = std::thread(WorkerThreadMain, this);
-    XR_LOG_INFO("VisionPreview started mode=%s name=%s bind=%s port=%u",
+    XR_LOG_INFO("VisionPreview started mode=%s name=%s bind=%s port=%u max_fps=%.2f",
                 output_mode_.c_str(), preview_window_name_.c_str(),
-                web_bind_address_.c_str(), static_cast<unsigned>(runtime_.web_port));
+                web_bind_address_.c_str(), static_cast<unsigned>(runtime_.web_port),
+                runtime_.max_fps);
     return true;
   }
 
@@ -122,9 +129,24 @@ class VisionPreview
 
   uint32_t DroppedFrames() const { return dropped_frames_.load(std::memory_order_relaxed); }
 
+  uint32_t RateDroppedFrames() const
+  {
+    return rate_dropped_frames_.load(std::memory_order_relaxed);
+  }
+
+  uint32_t AcceptedFrames() const
+  {
+    return accepted_frames_.load(std::memory_order_relaxed);
+  }
+
   bool Submit(const cv::Mat& frame, DrawCallback draw)
   {
     if (!Running() || frame.empty())
+    {
+      return false;
+    }
+
+    if (!AcceptByRateLimit())
     {
       return false;
     }
@@ -137,6 +159,7 @@ class VisionPreview
     {
       return false;
     }
+    accepted_frames_.fetch_add(1, std::memory_order_relaxed);
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -166,9 +189,10 @@ class VisionPreview
     cv_.notify_all();
     if (was_running)
     {
-      XR_LOG_INFO("VisionPreview stopping mode=%s name=%s dropped=%u",
-                  output_mode_.c_str(), preview_window_name_.c_str(),
-                  DroppedFrames());
+      XR_LOG_INFO(
+          "VisionPreview stopping mode=%s name=%s accepted=%u rate_dropped=%u queue_dropped=%u",
+          output_mode_.c_str(), preview_window_name_.c_str(),
+          AcceptedFrames(), RateDroppedFrames(), DroppedFrames());
     }
     if (worker_thread_.joinable() &&
         worker_thread_.get_id() != std::this_thread::get_id())
@@ -209,6 +233,41 @@ class VisionPreview
   }
 
   bool WindowMode() const { return output_mode_ == "window"; }
+
+  void ConfigureRateLimit(double max_fps)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (max_fps > 0.0)
+    {
+      const auto period_ns = static_cast<int64_t>(std::llround(1.0e9 / max_fps));
+      min_submit_interval_ =
+          std::chrono::nanoseconds(std::max<int64_t>(period_ns, 1));
+    }
+    else
+    {
+      min_submit_interval_ = std::chrono::steady_clock::duration::zero();
+    }
+    next_accept_time_ = std::chrono::steady_clock::time_point{};
+  }
+
+  bool AcceptByRateLimit()
+  {
+    if (min_submit_interval_ <= std::chrono::steady_clock::duration::zero())
+    {
+      return true;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (now < next_accept_time_)
+    {
+      rate_dropped_frames_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    next_accept_time_ = now + min_submit_interval_;
+    return true;
+  }
 
   static bool UiAvailable()
   {
@@ -961,8 +1020,12 @@ class VisionPreview
   std::thread worker_thread_{};
   std::atomic<bool> running_{false};
   std::atomic<uint32_t> dropped_frames_{0};
+  std::atomic<uint32_t> rate_dropped_frames_{0};
+  std::atomic<uint32_t> accepted_frames_{0};
   std::mutex mutex_{};
   std::condition_variable cv_{};
+  std::chrono::steady_clock::duration min_submit_interval_{};
+  std::chrono::steady_clock::time_point next_accept_time_{};
   std::size_t queue_capacity_{1};
   std::size_t queued_count_{0};
   Job job_{};

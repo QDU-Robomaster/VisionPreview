@@ -4,7 +4,7 @@
 
 它不订阅 topic，不做录像，不写 TSV，也不关心 detector/tracker 的消息类型。需要实时预览的模块直接组合它，在自己的线程里调用 `Submit(frame, draw_callback)`。
 
-`enabled` 是总开关：`false` 时不启动线程，`Submit()` 直接返回 `false`；`true` 时根据 `output_mode` 输出预览。`output_mode: "window"` 使用 OpenCV 窗口；`output_mode: "raw"`、`"web"`、`"http"` 或 `"bmp"` 启动未压缩 BMP 推流，不依赖显示屏或 `DISPLAY`。`Submit()` 会在调用线程里深拷贝输入图像，然后立即返回。预览线程拿到这份拷贝后执行 `draw_callback(cv::Mat&)` 绘制 overlay，再显示或推流。预览线程处理不过来时丢旧帧，不反压 detector、tracker 或相机同步线程。
+`enabled` 是总开关：`false` 时不启动线程，`Submit()` 直接返回 `false`；`true` 时根据 `output_mode` 输出预览。`output_mode: "window"` 使用 OpenCV 窗口；`output_mode: "raw"`、`"web"`、`"http"` 或 `"bmp"` 启动未压缩 BMP 推流，不依赖显示屏或 `DISPLAY`。`Submit()` 会先按 `max_fps` 限频，未到间隔时直接返回，不深拷贝图像；通过限频后才在调用线程里深拷贝输入图像，然后立即返回。预览线程拿到这份拷贝后执行 `draw_callback(cv::Mat&)` 绘制 overlay，再显示或推流。预览线程处理不过来时丢旧帧，不反压 detector、tracker 或相机同步线程。
 
 多个模块可以同时开 web 预览。同一个进程内相同 `web_bind_address:web_port` 会复用同一个 HTTP server，每个 `VisionPreview` 实例注册一个独立 stream。浏览器打开根路径会看到所有 stream；单独取流路径是 `/stream/<web_stream_name>`。关键节点会通过 `XR_LOG_*` 打印：server 启动/复用、stream 注册/注销、客户端连接/断开、404 和首帧发布。
 
@@ -19,6 +19,7 @@
 - `web_bind_address`：web 监听地址，默认 `0.0.0.0`。
 - `web_port`：web 监听端口，默认 `8080`。
 - `web_stream_name`：web stream 名；为空时由 `preview_window_name` 生成。
+- `max_fps`：预览最大接受帧率，默认 `30.0`；小于等于 `0` 表示不限频。
 
 最小用法：
 
@@ -46,6 +47,7 @@ VisionPreview preview({
     .web_bind_address = "0.0.0.0",
     .web_port = 8080,
     .web_stream_name = "armor_detector",
+    .max_fps = 30.0,
 });
 ```
 
