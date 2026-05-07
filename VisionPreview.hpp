@@ -14,7 +14,6 @@
 #include <mutex>
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <sstream>
 #include <string>
@@ -49,15 +48,13 @@ class VisionPreview
     int preview_wait_key_ms = 1;
     // 预览任务队列长度；取值会限制到 [1, 2]，队列满时丢弃旧帧。
     std::size_t queue_capacity = 1;
-    // 输出模式："window" 使用 OpenCV 窗口；"mjpeg" 启动 HTTP MJPEG 推流。
+    // 输出模式："window" 使用 OpenCV 窗口；"raw/web/http/bmp" 启动未压缩 BMP 推流。
     std::string_view output_mode = "window";
-    // MJPEG 服务监听地址；实机远程查看通常用 "0.0.0.0"。
+    // Web 服务监听地址；实机远程查看通常用 "0.0.0.0"。
     std::string_view web_bind_address = "0.0.0.0";
-    // MJPEG 服务端口；浏览器访问 http://<host>:<port>/。
+    // Web 服务端口；浏览器访问 http://<host>:<port>/。
     uint16_t web_port = 8080;
-    // MJPEG JPEG 编码质量，范围会限制到 [1, 100]。
-    int web_jpeg_quality = 80;
-    // MJPEG 路由名；为空时用 preview_window_name 生成，例如 /stream/armor_detector_preview.mjpg。
+    // Web 路由名；为空时用 preview_window_name 生成，例如 /stream/armor_detector_preview。
     std::string_view web_stream_name = "";
   };
 
@@ -86,6 +83,12 @@ class VisionPreview
     dropped_frames_.store(0, std::memory_order_relaxed);
     if (!ShouldRun())
     {
+      return false;
+    }
+    if (!WindowMode() && !WebMode())
+    {
+      XR_LOG_ERROR("VisionPreview disabled: unsupported output_mode=%s name=%s",
+                   output_mode_.c_str(), preview_window_name_.c_str());
       return false;
     }
 
@@ -201,10 +204,11 @@ class VisionPreview
 
   bool WebMode() const
   {
-    return output_mode_ == "mjpeg" || output_mode_ == "web" || output_mode_ == "http";
+    return output_mode_ == "raw" || output_mode_ == "bmp" ||
+           output_mode_ == "web" || output_mode_ == "http";
   }
 
-  bool WindowMode() const { return !WebMode(); }
+  bool WindowMode() const { return output_mode_ == "window"; }
 
   static bool UiAvailable()
   {
@@ -284,7 +288,7 @@ class VisionPreview
   {
     if (WebMode())
     {
-      PublishMjpegFrame(canvas);
+      PublishWebFrame(canvas);
       return;
     }
 
@@ -292,12 +296,10 @@ class VisionPreview
     cv::waitKey(std::max(runtime_.preview_wait_key_ms, 1));
   }
 
-  void PublishMjpegFrame(const cv::Mat& canvas)
+  void PublishWebFrame(const cv::Mat& canvas)
   {
-    std::vector<uchar> encoded;
-    const int quality = std::clamp(runtime_.web_jpeg_quality, 1, 100);
-    std::vector<int> params{cv::IMWRITE_JPEG_QUALITY, quality};
-    if (!cv::imencode(".jpg", canvas, encoded, params))
+    std::vector<uchar> encoded = EncodeBmp(canvas);
+    if (encoded.empty())
     {
       return;
     }
@@ -310,24 +312,103 @@ class VisionPreview
     stream->Publish(std::move(encoded));
   }
 
+  static void WriteLe16(std::vector<uchar>& out, std::size_t offset, uint16_t value)
+  {
+    out[offset] = static_cast<uchar>(value & 0xFFU);
+    out[offset + 1U] = static_cast<uchar>((value >> 8U) & 0xFFU);
+  }
+
+  static void WriteLe32(std::vector<uchar>& out, std::size_t offset, uint32_t value)
+  {
+    out[offset] = static_cast<uchar>(value & 0xFFU);
+    out[offset + 1U] = static_cast<uchar>((value >> 8U) & 0xFFU);
+    out[offset + 2U] = static_cast<uchar>((value >> 16U) & 0xFFU);
+    out[offset + 3U] = static_cast<uchar>((value >> 24U) & 0xFFU);
+  }
+
+  static std::vector<uchar> EncodeBmp(const cv::Mat& canvas)
+  {
+    if (canvas.empty() || canvas.depth() != CV_8U)
+    {
+      return {};
+    }
+
+    cv::Mat bgr;
+    if (canvas.channels() == 3)
+    {
+      bgr = canvas;
+    }
+    else if (canvas.channels() == 4)
+    {
+      cv::cvtColor(canvas, bgr, cv::COLOR_BGRA2BGR);
+    }
+    else if (canvas.channels() == 1)
+    {
+      cv::cvtColor(canvas, bgr, cv::COLOR_GRAY2BGR);
+    }
+    else
+    {
+      return {};
+    }
+
+    const int width = bgr.cols;
+    const int height = bgr.rows;
+    if (width <= 0 || height <= 0)
+    {
+      return {};
+    }
+
+    const std::size_t row_bytes = static_cast<std::size_t>(width) * 3U;
+    const std::size_t stride = (row_bytes + 3U) & ~std::size_t{3U};
+    const std::size_t image_size = stride * static_cast<std::size_t>(height);
+    const std::size_t header_size = 54U;
+    const std::size_t file_size = header_size + image_size;
+    if (file_size > 0xFFFFFFFFULL)
+    {
+      return {};
+    }
+
+    std::vector<uchar> out(file_size, 0);
+    out[0] = static_cast<uchar>('B');
+    out[1] = static_cast<uchar>('M');
+    WriteLe32(out, 2, static_cast<uint32_t>(file_size));
+    WriteLe32(out, 10, static_cast<uint32_t>(header_size));
+    WriteLe32(out, 14, 40U);
+    WriteLe32(out, 18, static_cast<uint32_t>(width));
+    // 负高度表示 top-down BMP，行顺序与 cv::Mat 保持一致。
+    WriteLe32(out, 22, static_cast<uint32_t>(-height));
+    WriteLe16(out, 26, 1U);
+    WriteLe16(out, 28, 24U);
+    WriteLe32(out, 34, static_cast<uint32_t>(image_size));
+
+    uchar* dst = out.data() + header_size;
+    for (int y = 0; y < height; ++y)
+    {
+      const uchar* src = bgr.ptr<uchar>(y);
+      std::copy(src, src + row_bytes, dst + static_cast<std::size_t>(y) * stride);
+    }
+    return out;
+  }
+
   struct WebStream
   {
     explicit WebStream(std::string stream_name) : name(std::move(stream_name)) {}
 
-    void Publish(std::vector<uchar> jpeg)
+    void Publish(std::vector<uchar> frame)
     {
-      const auto byte_count = jpeg.size();
+      const auto byte_count = frame.size();
       const bool first_frame = !first_frame_logged.exchange(true, std::memory_order_acq_rel);
       {
         std::lock_guard<std::mutex> lock(mutex);
-        latest_jpeg = std::move(jpeg);
+        latest_frame = std::move(frame);
         ++frame_seq;
       }
       cv.notify_all();
       if (first_frame)
       {
-        XR_LOG_INFO("VisionPreview stream first frame: /stream/%s.mjpg bytes=%u",
-                    name.c_str(), static_cast<unsigned>(byte_count));
+        XR_LOG_INFO("VisionPreview stream first frame: /stream/%s type=image/bmp bytes=%u",
+                    name.c_str(),
+                    static_cast<unsigned>(byte_count));
       }
     }
 
@@ -340,7 +421,7 @@ class VisionPreview
     std::string name;
     std::mutex mutex;
     std::condition_variable cv;
-    std::vector<uchar> latest_jpeg;
+    std::vector<uchar> latest_frame;
     uint64_t frame_seq{0};
     std::atomic<bool> active{true};
     std::atomic<bool> first_frame_logged{false};
@@ -390,7 +471,7 @@ class VisionPreview
 
       auto stream = std::make_shared<WebStream>(name);
       streams_.emplace(name, stream);
-      XR_LOG_PASS("VisionPreview stream registered: /stream/%s.mjpg", name.c_str());
+      XR_LOG_PASS("VisionPreview stream registered: /stream/%s", name.c_str());
       return stream;
     }
 
@@ -408,7 +489,7 @@ class VisionPreview
         if (it != streams_.end() && it->second == stream)
         {
           streams_.erase(it);
-          XR_LOG_INFO("VisionPreview stream unregistered: /stream/%s.mjpg",
+          XR_LOG_INFO("VisionPreview stream unregistered: /stream/%s",
                       stream->name.c_str());
         }
         empty = streams_.empty();
@@ -630,7 +711,7 @@ class VisionPreview
         return;
       }
 
-      StreamMjpeg(client_fd, stream);
+      StreamMultipart(client_fd, stream);
       XR_LOG_INFO("VisionPreview web client disconnected stream=%s",
                   stream->name.c_str());
       ::close(client_fd);
@@ -684,7 +765,7 @@ class VisionPreview
     std::shared_ptr<WebStream> ResolveStream(const std::string& path)
     {
       std::lock_guard<std::mutex> lock(streams_mutex_);
-      if ((path == "/stream.mjpg" || path == "/stream") && streams_.size() == 1)
+      if (path == "/stream" && streams_.size() == 1)
       {
         return streams_.begin()->second;
       }
@@ -697,13 +778,6 @@ class VisionPreview
       }
 
       std::string name = path.substr(prefix.size());
-      static constexpr std::string_view suffix = ".mjpg";
-      if (name.size() >= suffix.size() &&
-          name.compare(name.size() - suffix.size(), suffix.size(),
-                       suffix.data(), suffix.size()) == 0)
-      {
-        name.resize(name.size() - suffix.size());
-      }
       auto it = streams_.find(name);
       if (it == streams_.end())
       {
@@ -729,7 +803,7 @@ class VisionPreview
         for (const auto& item : streams_)
         {
           body << "<section><h2>" << item.first << "</h2><img src=\"/stream/"
-               << item.first << ".mjpg\" alt=\"" << item.first << "\"></section>";
+               << item.first << "\" alt=\"" << item.first << "\"></section>";
         }
       }
       body << "</body></html>";
@@ -746,7 +820,7 @@ class VisionPreview
       return SendAll(client_fd, data.data(), data.size());
     }
 
-    void StreamMjpeg(int client_fd, const std::shared_ptr<WebStream>& stream)
+    void StreamMultipart(int client_fd, const std::shared_ptr<WebStream>& stream)
     {
       static constexpr std::string_view header =
           "HTTP/1.1 200 OK\r\n"
@@ -763,7 +837,7 @@ class VisionPreview
       while (running_.load(std::memory_order_acquire) &&
              stream->active.load(std::memory_order_acquire))
       {
-        std::vector<uchar> jpeg;
+        std::vector<uchar> frame;
         {
           std::unique_lock<std::mutex> lock(stream->mutex);
           stream->cv.wait(lock, [this, &stream, last_seq]()
@@ -776,20 +850,20 @@ class VisionPreview
             break;
           }
           last_seq = stream->frame_seq;
-          jpeg = stream->latest_jpeg;
+          frame = stream->latest_frame;
         }
-        if (jpeg.empty())
+        if (frame.empty())
         {
           continue;
         }
 
         std::ostringstream part_header;
         part_header << "--frame\r\n"
-                    << "Content-Type: image/jpeg\r\n"
-                    << "Content-Length: " << jpeg.size() << "\r\n\r\n";
+                    << "Content-Type: image/bmp\r\n"
+                    << "Content-Length: " << frame.size() << "\r\n\r\n";
         const std::string part = part_header.str();
         if (!SendAll(client_fd, part.data(), part.size()) ||
-            !SendAll(client_fd, reinterpret_cast<const char*>(jpeg.data()), jpeg.size()) ||
+            !SendAll(client_fd, reinterpret_cast<const char*>(frame.data()), frame.size()) ||
             !SendAll(client_fd, "\r\n", 2))
         {
           break;
@@ -874,7 +948,7 @@ class VisionPreview
       web_server_.reset();
       return false;
     }
-    XR_LOG_INFO("VisionPreview web stream ready url=/stream/%s.mjpg",
+    XR_LOG_INFO("VisionPreview web stream ready url=/stream/%s encoding=bmp",
                 web_stream_name_.c_str());
     return true;
   }
