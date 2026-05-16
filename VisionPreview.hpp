@@ -1,5 +1,25 @@
 #pragma once
 
+// clang-format off
+/* === MODULE MANIFEST V2 ===
+module_description: 实时视觉预览输出工具
+constructor_args:
+  runtime:
+    enabled: false
+    preview_window_name: autoaim_preview
+    preview_scale: 1.0
+    preview_wait_key_ms: 1
+    queue_capacity: 1
+    output_mode: window
+    web_bind_address: 0.0.0.0
+    web_port: 8080
+    web_stream_name: ""
+    max_fps: 30.0
+required_hardware: []
+depends: []
+=== END MANIFEST === */
+// clang-format on
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -34,41 +54,67 @@
 
 #include "logger.hpp"
 
+/**
+ * @brief 异步图像预览工具。
+ *
+ * 调用方提交一帧 OpenCV 图像和一个绘制回调。`VisionPreview` 在自己的线程里执行绘制，
+ * 然后输出到 OpenCV 窗口或内置 HTTP BMP 流。提交线程只负责限频、拷贝图像和入队。
+ */
 class VisionPreview
 {
  public:
+  /**
+   * @brief 运行时配置。
+   */
   struct RuntimeParam
   {
-    // 预览子系统总开关；false 时不启动预览线程，Submit() 直接返回 false。
+    /// 预览总开关；false 时不启动预览线程，Submit() 直接返回 false。
     bool enabled = false;
-    // OpenCV 窗口名；同进程内不同模块应使用不同名字。
+    /// OpenCV 窗口名；同进程内不同模块应使用不同名字。
     std::string_view preview_window_name = "autoaim_preview";
-    // 显示缩放比例，只影响窗口画面，不修改调用方传入的原图。
+    /// 显示缩放比例，只影响窗口画面，不修改调用方传入的原图。
     double preview_scale = 1.0;
-    // cv::waitKey 的事件轮询时间，最小按 1 ms 执行。
+    /// cv::waitKey 的事件轮询时间，最小按 1 ms 执行。
     int preview_wait_key_ms = 1;
-    // 预览任务队列长度；取值会限制到 [1, 2]，队列满时丢弃旧帧。
+    /// 预览任务队列长度；取值会限制到 [1, 2]，队列满时丢弃等待帧。
     std::size_t queue_capacity = 1;
-    // 输出模式："window" 使用 OpenCV 窗口；"raw/web/http/bmp" 启动未压缩 BMP 推流。
+    /// 输出模式："window" 使用 OpenCV 窗口；"raw/web/http/bmp" 启动未压缩 BMP 推流。
     std::string_view output_mode = "window";
-    // Web 服务监听地址；实机远程查看通常用 "0.0.0.0"。
+    /// Web 服务监听地址；实机远程查看通常用 "0.0.0.0"。
     std::string_view web_bind_address = "0.0.0.0";
-    // Web 服务端口；浏览器访问 http://<host>:<port>/。
+    /// Web 服务端口；浏览器访问 http://<host>:<port>/。
     uint16_t web_port = 8080;
-    // Web 路由名；为空时用 preview_window_name 生成，例如 /stream/armor_detector_preview。
+    /// Web 路由名；为空时用 preview_window_name 生成，例如 /stream/armor_detector_preview。
     std::string_view web_stream_name = "";
-    // 预览最大接受帧率；<= 0 表示不限频。限频在 Submit() 入口执行，未到间隔时不拷贝图像。
+    /// 预览最大接受帧率；<= 0 表示不限频。限频在 Submit() 入口执行，未到间隔时不拷贝图像。
     double max_fps = 30.0;
   };
 
+  /**
+   * @brief 在预览线程里执行的绘制回调。
+   */
   using DrawCallback = std::function<void(cv::Mat&)>;
 
+  /**
+   * @brief 构造未启动的预览对象。
+   */
   VisionPreview() = default;
 
+  /**
+   * @brief 构造并启动预览对象。
+   */
   explicit VisionPreview(RuntimeParam runtime) { Start(runtime); }
 
+  /**
+   * @brief 停止预览线程和 web stream。
+   */
   ~VisionPreview() { Stop(); }
 
+  /**
+   * @brief 按配置启动预览。
+   *
+   * @return 启动成功返回 true；配置关闭或启动失败返回 false。
+   */
   bool Start(RuntimeParam runtime)
   {
     if (Running())
@@ -125,20 +171,39 @@ class VisionPreview
     return true;
   }
 
+  /**
+   * @brief 查询预览线程是否正在运行。
+   */
   bool Running() const { return running_.load(std::memory_order_acquire); }
 
+  /**
+   * @brief 队列满时丢弃的帧数。
+   */
   uint32_t DroppedFrames() const { return dropped_frames_.load(std::memory_order_relaxed); }
 
+  /**
+   * @brief 因 max_fps 限频丢弃的帧数。
+   */
   uint32_t RateDroppedFrames() const
   {
     return rate_dropped_frames_.load(std::memory_order_relaxed);
   }
 
+  /**
+   * @brief 已接受并入队的帧数。
+   */
   uint32_t AcceptedFrames() const
   {
     return accepted_frames_.load(std::memory_order_relaxed);
   }
 
+  /**
+   * @brief 提交一帧图像和绘制回调。
+   *
+   * 通过限频后会深拷贝 `frame`，调用方可以立即复用原图。`draw` 在预览线程里执行。
+   *
+   * @return 已接受入队返回 true；未运行、空图像或被限频丢弃返回 false。
+   */
   bool Submit(const cv::Mat& frame, DrawCallback draw)
   {
     if (!Running() || frame.empty())
@@ -183,6 +248,9 @@ class VisionPreview
     return true;
   }
 
+  /**
+   * @brief 停止预览线程、注销 web stream，并等待后台线程退出。
+   */
   void Stop()
   {
     const bool was_running = running_.exchange(false, std::memory_order_acq_rel);
@@ -210,9 +278,14 @@ class VisionPreview
  private:
   struct Job
   {
+    /// 预览线程持有的图像拷贝。
     cv::Mat frame;
+    /// 针对这帧图像执行的绘制回调。
     DrawCallback draw;
 
+    /**
+     * @brief 清空图像和回调。
+     */
     void Reset()
     {
       frame.release();
@@ -220,20 +293,32 @@ class VisionPreview
     }
   };
 
+  /**
+   * @brief 根据总开关判断是否需要启动。
+   */
   bool ShouldRun() const
   {
     // enabled 是总开关；具体输出由 output_mode 决定。
     return runtime_.enabled;
   }
 
+  /**
+   * @brief 当前配置是否为 web/BMP 输出。
+   */
   bool WebMode() const
   {
     return output_mode_ == "raw" || output_mode_ == "bmp" ||
            output_mode_ == "web" || output_mode_ == "http";
   }
 
+  /**
+   * @brief 当前配置是否为 OpenCV 窗口输出。
+   */
   bool WindowMode() const { return output_mode_ == "window"; }
 
+  /**
+   * @brief 根据 max_fps 计算提交间隔。
+   */
   void ConfigureRateLimit(double max_fps)
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -250,6 +335,9 @@ class VisionPreview
     next_accept_time_ = std::chrono::steady_clock::time_point{};
   }
 
+  /**
+   * @brief 判断当前提交是否通过限频。
+   */
   bool AcceptByRateLimit()
   {
     if (min_submit_interval_ <= std::chrono::steady_clock::duration::zero())
@@ -269,6 +357,9 @@ class VisionPreview
     return true;
   }
 
+  /**
+   * @brief 判断当前进程是否有可用图形显示后端。
+   */
   static bool UiAvailable()
   {
     const char* display = std::getenv("DISPLAY");
@@ -277,6 +368,9 @@ class VisionPreview
            (wayland_display != nullptr && wayland_display[0] != '\0');
   }
 
+  /**
+   * @brief 丢弃队列中最早进入队列的未处理帧。
+   */
   void DropOldestLocked()
   {
     if (queued_count_ == 0)
@@ -284,13 +378,16 @@ class VisionPreview
       return;
     }
 
-    // 预览永远不反压主链路；队列满时丢掉最旧的未显示帧。
+    // 预览永远不反压主链路；队列满时丢掉最早进入队列的未显示帧。
     job_ = std::move(next_job_);
     next_job_.Reset();
     --queued_count_;
     dropped_frames_.fetch_add(1, std::memory_order_relaxed);
   }
 
+  /**
+   * @brief 从队列取出下一帧预览任务。
+   */
   bool Pop(Job& job)
   {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -308,6 +405,9 @@ class VisionPreview
     return true;
   }
 
+  /**
+   * @brief 预览线程入口。
+   */
   static void WorkerThreadMain(VisionPreview* self)
   {
     while (self->running_.load(std::memory_order_acquire))
@@ -321,6 +421,9 @@ class VisionPreview
     }
   }
 
+  /**
+   * @brief 执行绘制回调、缩放并输出一帧。
+   */
   void Process(Job& job)
   {
     cv::Mat canvas = std::move(job.frame);
@@ -343,6 +446,9 @@ class VisionPreview
     }
   }
 
+  /**
+   * @brief 按当前输出模式显示或推流一帧。
+   */
   void OutputFrame(const cv::Mat& canvas)
   {
     if (WebMode())
@@ -355,6 +461,9 @@ class VisionPreview
     cv::waitKey(std::max(runtime_.preview_wait_key_ms, 1));
   }
 
+  /**
+   * @brief 将一帧编码为 BMP 并发布到 web stream。
+   */
   void PublishWebFrame(const cv::Mat& canvas)
   {
     std::vector<uchar> encoded = EncodeBmp(canvas);
@@ -371,12 +480,18 @@ class VisionPreview
     stream->Publish(std::move(encoded));
   }
 
+  /**
+   * @brief 向字节数组写入小端 16 位整数。
+   */
   static void WriteLe16(std::vector<uchar>& out, std::size_t offset, uint16_t value)
   {
     out[offset] = static_cast<uchar>(value & 0xFFU);
     out[offset + 1U] = static_cast<uchar>((value >> 8U) & 0xFFU);
   }
 
+  /**
+   * @brief 向字节数组写入小端 32 位整数。
+   */
   static void WriteLe32(std::vector<uchar>& out, std::size_t offset, uint32_t value)
   {
     out[offset] = static_cast<uchar>(value & 0xFFU);
@@ -385,6 +500,9 @@ class VisionPreview
     out[offset + 3U] = static_cast<uchar>((value >> 24U) & 0xFFU);
   }
 
+  /**
+   * @brief 将 OpenCV 图像编码为 top-down 24 位 BMP。
+   */
   static std::vector<uchar> EncodeBmp(const cv::Mat& canvas)
   {
     if (canvas.empty() || canvas.depth() != CV_8U)
@@ -449,10 +567,19 @@ class VisionPreview
     return out;
   }
 
+  /**
+   * @brief 一个 web 预览流的最新帧缓存。
+   */
   struct WebStream
   {
+    /**
+     * @brief 创建指定名称的 stream。
+     */
     explicit WebStream(std::string stream_name) : name(std::move(stream_name)) {}
 
+    /**
+     * @brief 更新最新帧并唤醒等待中的 HTTP 客户端。
+     */
     void Publish(std::vector<uchar> frame)
     {
       const auto byte_count = frame.size();
@@ -471,24 +598,40 @@ class VisionPreview
       }
     }
 
+    /**
+     * @brief 标记 stream 关闭并唤醒客户端。
+     */
     void Close()
     {
       active.store(false, std::memory_order_release);
       cv.notify_all();
     }
 
+    /// stream 名称，对应 `/stream/<name>`。
     std::string name;
+    /// 保护 latest_frame 和 frame_seq。
     std::mutex mutex;
+    /// 新帧通知。
     std::condition_variable cv;
+    /// 最近一次发布的 BMP 数据。
     std::vector<uchar> latest_frame;
+    /// 最新帧序号。
     uint64_t frame_seq{0};
+    /// stream 是否仍可向客户端输出。
     std::atomic<bool> active{true};
+    /// 首帧日志是否已经输出。
     std::atomic<bool> first_frame_logged{false};
   };
 
+  /**
+   * @brief 同进程共享的 HTTP 预览服务器。
+   */
   class WebServer : public std::enable_shared_from_this<WebServer>
   {
    public:
+    /**
+     * @brief 获取或创建指定地址和端口的服务器。
+     */
     static std::shared_ptr<WebServer> Acquire(std::string bind_address, uint16_t port)
     {
 #if defined(_WIN32)
@@ -517,8 +660,14 @@ class VisionPreview
 #endif
     }
 
+    /**
+     * @brief 停止服务器和客户端线程。
+     */
     ~WebServer() { Stop(); }
 
+    /**
+     * @brief 注册一个新的预览流。
+     */
     std::shared_ptr<WebStream> RegisterStream(const std::string& name)
     {
       std::lock_guard<std::mutex> lock(streams_mutex_);
@@ -534,6 +683,9 @@ class VisionPreview
       return stream;
     }
 
+    /**
+     * @brief 注销预览流；最后一个流注销后停止服务器。
+     */
     void UnregisterStream(const std::shared_ptr<WebStream>& stream)
     {
       if (!stream)
@@ -567,18 +719,27 @@ class VisionPreview
     {
     }
 
+    /**
+     * @brief 全局服务器注册表互斥锁。
+     */
     static std::mutex& RegistryMutex()
     {
       static std::mutex mutex;
       return mutex;
     }
 
+    /**
+     * @brief 按 bind:port 保存已启动服务器。
+     */
     static std::map<std::string, std::weak_ptr<WebServer>>& Registry()
     {
       static std::map<std::string, std::weak_ptr<WebServer>> registry;
       return registry;
     }
 
+    /**
+     * @brief 创建 socket、绑定端口并启动 accept 线程。
+     */
     bool Start()
     {
 #if defined(_WIN32)
@@ -633,6 +794,9 @@ class VisionPreview
 #endif
     }
 
+    /**
+     * @brief 停止服务器、关闭 socket 并等待客户端线程退出。
+     */
     void Stop()
     {
       const bool was_running = running_.exchange(false, std::memory_order_acq_rel);
@@ -651,6 +815,9 @@ class VisionPreview
       JoinClientThreads();
     }
 
+    /**
+     * @brief 关闭监听 socket。
+     */
     void CloseServerSocket()
     {
 #if !defined(_WIN32)
@@ -663,6 +830,9 @@ class VisionPreview
 #endif
     }
 
+    /**
+     * @brief 通知所有 stream 关闭。
+     */
     void NotifyStreamsClosed()
     {
       std::lock_guard<std::mutex> lock(streams_mutex_);
@@ -672,11 +842,17 @@ class VisionPreview
       }
     }
 
+    /**
+     * @brief HTTP 服务器线程入口。
+     */
     static void ServerThreadMain(WebServer* self)
     {
       self->ServerLoop();
     }
 
+    /**
+     * @brief 接受客户端连接。
+     */
     void ServerLoop()
     {
 #if !defined(_WIN32)
@@ -712,12 +888,18 @@ class VisionPreview
 #endif
     }
 
+    /**
+     * @brief 为新客户端创建处理线程。
+     */
     void AddClientThread(int client_fd)
     {
       std::lock_guard<std::mutex> lock(client_threads_mutex_);
       client_threads_.emplace_back(ClientThreadMain, this, client_fd);
     }
 
+    /**
+     * @brief 等待所有客户端线程退出。
+     */
     void JoinClientThreads()
     {
       std::vector<std::thread> threads;
@@ -735,11 +917,17 @@ class VisionPreview
       }
     }
 
+    /**
+     * @brief 客户端处理线程入口。
+     */
     static void ClientThreadMain(WebServer* self, int client_fd)
     {
       self->HandleClient(client_fd);
     }
 
+    /**
+     * @brief 解析请求并返回首页、404 或 multipart stream。
+     */
     void HandleClient(int client_fd)
     {
 #if !defined(_WIN32)
@@ -779,6 +967,9 @@ class VisionPreview
 #endif
     }
 
+    /**
+     * @brief 读取 HTTP 请求头。
+     */
     static std::string ReadHttpRequest(int client_fd)
     {
       std::string request;
@@ -803,6 +994,9 @@ class VisionPreview
       return request;
     }
 
+    /**
+     * @brief 从 HTTP 请求行提取 path，忽略 query。
+     */
     static std::string ParseRequestPath(const std::string& request)
     {
       std::istringstream stream(request);
@@ -821,6 +1015,9 @@ class VisionPreview
       return path;
     }
 
+    /**
+     * @brief 根据 URL path 查找 stream。
+     */
     std::shared_ptr<WebStream> ResolveStream(const std::string& path)
     {
       std::lock_guard<std::mutex> lock(streams_mutex_);
@@ -845,6 +1042,9 @@ class VisionPreview
       return it->second;
     }
 
+    /**
+     * @brief 返回列出所有 stream 的简单 HTML 页面。
+     */
     bool SendIndexPage(int client_fd)
     {
       std::ostringstream body;
@@ -879,6 +1079,9 @@ class VisionPreview
       return SendAll(client_fd, data.data(), data.size());
     }
 
+    /**
+     * @brief 按 multipart/x-mixed-replace 输出 BMP 帧。
+     */
     void StreamMultipart(int client_fd, const std::shared_ptr<WebStream>& stream)
     {
       static constexpr std::string_view header =
@@ -930,6 +1133,9 @@ class VisionPreview
       }
     }
 
+    /**
+     * @brief 阻塞发送完整缓冲区。
+     */
     static bool SendAll(int fd, const char* data, std::size_t size)
     {
 #if !defined(_WIN32)
@@ -961,17 +1167,29 @@ class VisionPreview
 #endif
     }
 
+    /// 监听地址。
     std::string bind_address_;
+    /// 监听端口。
     uint16_t port_{8080};
+    /// 服务器线程是否运行。
     std::atomic<bool> running_{false};
+    /// 监听 socket fd。
     std::atomic<int> server_fd_{-1};
+    /// accept 线程。
     std::thread server_thread_;
+    /// 保护 streams_。
     std::mutex streams_mutex_;
+    /// 已注册 stream。
     std::map<std::string, std::shared_ptr<WebStream>> streams_;
+    /// 保护 client_threads_。
     std::mutex client_threads_mutex_;
+    /// 当前已创建的客户端线程。
     std::vector<std::thread> client_threads_;
   };
 
+  /**
+   * @brief 将 stream 名转换成 URL path 可用的名称。
+   */
   static std::string NormalizeStreamName(std::string_view name)
   {
     std::string out;
@@ -994,6 +1212,9 @@ class VisionPreview
     return out;
   }
 
+  /**
+   * @brief 启动或复用 web server，并注册当前 stream。
+   */
   bool StartWebStream()
   {
     web_server_ = WebServer::Acquire(web_bind_address_, runtime_.web_port);
@@ -1012,24 +1233,44 @@ class VisionPreview
     return true;
   }
 
+  /// 当前运行时配置。
   RuntimeParam runtime_{};
+  /// OpenCV 窗口名。
   std::string preview_window_name_{"autoaim_preview"};
+  /// 输出模式。
   std::string output_mode_{"window"};
+  /// Web 监听地址。
   std::string web_bind_address_{"0.0.0.0"};
+  /// Web stream 名。
   std::string web_stream_name_{"autoaim_preview"};
+  /// 预览处理线程。
   std::thread worker_thread_{};
+  /// 预览线程运行标志。
   std::atomic<bool> running_{false};
+  /// 队列满丢弃计数。
   std::atomic<uint32_t> dropped_frames_{0};
+  /// 限频丢弃计数。
   std::atomic<uint32_t> rate_dropped_frames_{0};
+  /// 接受帧计数。
   std::atomic<uint32_t> accepted_frames_{0};
+  /// 保护队列和限频状态。
   std::mutex mutex_{};
+  /// 新任务通知。
   std::condition_variable cv_{};
+  /// 两次接受帧之间的最小间隔。
   std::chrono::steady_clock::duration min_submit_interval_{};
+  /// 下一次允许接受帧的时间点。
   std::chrono::steady_clock::time_point next_accept_time_{};
+  /// 队列容量，实际限制为 1 或 2。
   std::size_t queue_capacity_{1};
+  /// 当前队列中任务数量。
   std::size_t queued_count_{0};
+  /// 队首任务。
   Job job_{};
+  /// 第二个等待任务。
   Job next_job_{};
+  /// 共享 web server。
   std::shared_ptr<WebServer> web_server_{};
+  /// 当前实例注册的 web stream。
   std::shared_ptr<WebStream> web_stream_{};
 };
