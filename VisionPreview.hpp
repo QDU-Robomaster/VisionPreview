@@ -22,14 +22,14 @@ depends: []
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
-#include <cerrno>
-#include <cctype>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -84,9 +84,11 @@ class VisionPreview
     std::string_view web_bind_address = "0.0.0.0";
     /// Web 服务端口；浏览器访问 http://<host>:<port>/。
     uint16_t web_port = 8080;
-    /// Web 路由名；为空时用 preview_window_name 生成，例如 /stream/armor_detector_preview。
+    /// Web 路由名；为空时用 preview_window_name 生成，例如
+    /// /stream/armor_detector_preview。
     std::string_view web_stream_name = "";
-    /// 预览最大接受帧率；<= 0 表示不限频。限频在 Submit() 入口执行，未到间隔时不拷贝图像。
+    /// 预览最大接受帧率；<= 0 表示不限频。限频在 Submit()
+    /// 入口执行，未到间隔时不拷贝图像。
     double max_fps = 30.0;
   };
 
@@ -126,9 +128,9 @@ class VisionPreview
     preview_window_name_ = std::string(runtime.preview_window_name);
     output_mode_ = std::string(runtime.output_mode);
     web_bind_address_ = std::string(runtime.web_bind_address);
-    web_stream_name_ = NormalizeStreamName(
-        runtime.web_stream_name.empty() ? runtime.preview_window_name
-                                        : runtime.web_stream_name);
+    web_stream_name_ =
+        NormalizeStreamName(runtime.web_stream_name.empty() ? runtime.preview_window_name
+                                                            : runtime.web_stream_name);
     dropped_frames_.store(0, std::memory_order_relaxed);
     rate_dropped_frames_.store(0, std::memory_order_relaxed);
     accepted_frames_.store(0, std::memory_order_relaxed);
@@ -153,14 +155,17 @@ class VisionPreview
 
     queue_capacity_ = runtime.queue_capacity == 0 ? 1U : runtime.queue_capacity;
     queue_capacity_ = std::min<std::size_t>(queue_capacity_, 2U);
+    ClearQueuedJobs();
+    session_token_.fetch_add(1, std::memory_order_acq_rel);
     running_.store(true, std::memory_order_release);
     if (WebMode() && !StartWebStream())
     {
       running_.store(false, std::memory_order_release);
-      XR_LOG_ERROR(
-          "VisionPreview failed to start web stream name=%s bind=%s port=%u",
-          web_stream_name_.c_str(), web_bind_address_.c_str(),
-          static_cast<unsigned>(runtime_.web_port));
+      session_token_.fetch_add(1, std::memory_order_acq_rel);
+      ClearQueuedJobs();
+      XR_LOG_ERROR("VisionPreview failed to start web stream name=%s bind=%s port=%u",
+                   web_stream_name_.c_str(), web_bind_address_.c_str(),
+                   static_cast<unsigned>(runtime_.web_port));
       return false;
     }
     worker_thread_ = std::thread(WorkerThreadMain, this);
@@ -179,7 +184,10 @@ class VisionPreview
   /**
    * @brief 队列满时丢弃的帧数。
    */
-  uint32_t DroppedFrames() const { return dropped_frames_.load(std::memory_order_relaxed); }
+  uint32_t DroppedFrames() const
+  {
+    return dropped_frames_.load(std::memory_order_relaxed);
+  }
 
   /**
    * @brief 因 max_fps 限频丢弃的帧数。
@@ -206,12 +214,13 @@ class VisionPreview
    */
   bool Submit(const cv::Mat& frame, DrawCallback draw)
   {
-    if (!Running() || frame.empty())
+    if (frame.empty())
     {
       return false;
     }
 
-    if (!AcceptByRateLimit())
+    const uint64_t session_token = session_token_.load(std::memory_order_acquire);
+    if (!Running() || !AcceptByRateLimit(session_token))
     {
       return false;
     }
@@ -224,10 +233,13 @@ class VisionPreview
     {
       return false;
     }
-    accepted_frames_.fetch_add(1, std::memory_order_relaxed);
-
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      if (!running_.load(std::memory_order_acquire) ||
+          session_token_.load(std::memory_order_acquire) != session_token)
+      {
+        return false;
+      }
       while (queued_count_ >= queue_capacity_)
       {
         DropOldestLocked();
@@ -243,6 +255,7 @@ class VisionPreview
         next_job_ = std::move(job);
         queued_count_ = 2;
       }
+      accepted_frames_.fetch_add(1, std::memory_order_relaxed);
     }
     cv_.notify_one();
     return true;
@@ -254,19 +267,22 @@ class VisionPreview
   void Stop()
   {
     const bool was_running = running_.exchange(false, std::memory_order_acq_rel);
+    session_token_.fetch_add(1, std::memory_order_acq_rel);
     cv_.notify_all();
     if (was_running)
     {
       XR_LOG_INFO(
-          "VisionPreview stopping mode=%s name=%s accepted=%u rate_dropped=%u queue_dropped=%u",
-          output_mode_.c_str(), preview_window_name_.c_str(),
-          AcceptedFrames(), RateDroppedFrames(), DroppedFrames());
+          "VisionPreview stopping mode=%s name=%s accepted=%u rate_dropped=%u "
+          "queue_dropped=%u",
+          output_mode_.c_str(), preview_window_name_.c_str(), AcceptedFrames(),
+          RateDroppedFrames(), DroppedFrames());
     }
     if (worker_thread_.joinable() &&
         worker_thread_.get_id() != std::this_thread::get_id())
     {
       worker_thread_.join();
     }
+    ClearQueuedJobs();
     if (web_server_ && web_stream_)
     {
       web_server_->UnregisterStream(web_stream_);
@@ -307,8 +323,8 @@ class VisionPreview
    */
   bool WebMode() const
   {
-    return output_mode_ == "raw" || output_mode_ == "bmp" ||
-           output_mode_ == "web" || output_mode_ == "http";
+    return output_mode_ == "raw" || output_mode_ == "bmp" || output_mode_ == "web" ||
+           output_mode_ == "http";
   }
 
   /**
@@ -325,8 +341,7 @@ class VisionPreview
     if (max_fps > 0.0)
     {
       const auto period_ns = static_cast<int64_t>(std::llround(1.0e9 / max_fps));
-      min_submit_interval_ =
-          std::chrono::nanoseconds(std::max<int64_t>(period_ns, 1));
+      min_submit_interval_ = std::chrono::nanoseconds(std::max<int64_t>(period_ns, 1));
     }
     else
     {
@@ -338,15 +353,20 @@ class VisionPreview
   /**
    * @brief 判断当前提交是否通过限频。
    */
-  bool AcceptByRateLimit()
+  bool AcceptByRateLimit(uint64_t session_token)
   {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!running_.load(std::memory_order_acquire) ||
+        session_token_.load(std::memory_order_acquire) != session_token)
+    {
+      return false;
+    }
     if (min_submit_interval_ <= std::chrono::steady_clock::duration::zero())
     {
       return true;
     }
 
     const auto now = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(mutex_);
     if (now < next_accept_time_)
     {
       rate_dropped_frames_.fetch_add(1, std::memory_order_relaxed);
@@ -383,6 +403,17 @@ class VisionPreview
     next_job_.Reset();
     --queued_count_;
     dropped_frames_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  /**
+   * @brief 释放停止预览会话时仍由队列持有的全部任务。
+   */
+  void ClearQueuedJobs()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    job_.Reset();
+    next_job_.Reset();
+    queued_count_ = 0;
   }
 
   /**
@@ -583,18 +614,20 @@ class VisionPreview
     void Publish(std::vector<uchar> frame)
     {
       const auto byte_count = frame.size();
-      const bool first_frame = !first_frame_logged.exchange(true, std::memory_order_acq_rel);
+      const bool first_frame =
+          !first_frame_logged.exchange(true, std::memory_order_acq_rel);
+      auto snapshot = std::make_shared<const std::vector<uchar>>(std::move(frame));
       {
         std::lock_guard<std::mutex> lock(mutex);
-        latest_frame = std::move(frame);
+        latest_frame = std::move(snapshot);
         ++frame_seq;
       }
       cv.notify_all();
       if (first_frame)
       {
-        XR_LOG_INFO("VisionPreview stream first frame: /stream/%s type=image/bmp bytes=%u",
-                    name.c_str(),
-                    static_cast<unsigned>(byte_count));
+        XR_LOG_INFO(
+            "VisionPreview stream first frame: /stream/%s type=image/bmp bytes=%u",
+            name.c_str(), static_cast<unsigned>(byte_count));
       }
     }
 
@@ -613,8 +646,8 @@ class VisionPreview
     std::mutex mutex;
     /// 新帧通知。
     std::condition_variable cv;
-    /// 最近一次发布的 BMP 数据。
-    std::vector<uchar> latest_frame;
+    /// 最近一次发布的不可变 BMP 快照。
+    std::shared_ptr<const std::vector<uchar>> latest_frame;
     /// 最新帧序号。
     uint64_t frame_seq{0};
     /// stream 是否仍可向客户端输出。
@@ -648,7 +681,8 @@ class VisionPreview
         return existing;
       }
 
-      auto server = std::shared_ptr<WebServer>(new WebServer(std::move(bind_address), port));
+      auto server =
+          std::shared_ptr<WebServer>(new WebServer(std::move(bind_address), port));
       if (!server->Start())
       {
         XR_LOG_ERROR("VisionPreview web server start failed bind=%s port=%u",
@@ -764,8 +798,7 @@ class VisionPreview
       }
       else if (::inet_pton(AF_INET, bind_address_.c_str(), &addr.sin_addr) != 1)
       {
-        XR_LOG_ERROR("VisionPreview web bind address invalid: %s",
-                     bind_address_.c_str());
+        XR_LOG_ERROR("VisionPreview web bind address invalid: %s", bind_address_.c_str());
         ::close(fd);
         return false;
       }
@@ -845,10 +878,7 @@ class VisionPreview
     /**
      * @brief HTTP 服务器线程入口。
      */
-    static void ServerThreadMain(WebServer* self)
-    {
-      self->ServerLoop();
-    }
+    static void ServerThreadMain(WebServer* self) { self->ServerLoop(); }
 
     /**
      * @brief 接受客户端连接。
@@ -1099,13 +1129,16 @@ class VisionPreview
       while (running_.load(std::memory_order_acquire) &&
              stream->active.load(std::memory_order_acquire))
       {
-        std::vector<uchar> frame;
+        std::shared_ptr<const std::vector<uchar>> frame;
         {
           std::unique_lock<std::mutex> lock(stream->mutex);
-          stream->cv.wait(lock, [this, &stream, last_seq]()
-                          { return !running_.load(std::memory_order_acquire) ||
+          stream->cv.wait(lock,
+                          [this, &stream, last_seq]()
+                          {
+                            return !running_.load(std::memory_order_acquire) ||
                                    !stream->active.load(std::memory_order_acquire) ||
-                                   stream->frame_seq != last_seq; });
+                                   stream->frame_seq != last_seq;
+                          });
           if (!running_.load(std::memory_order_acquire) ||
               !stream->active.load(std::memory_order_acquire))
           {
@@ -1114,7 +1147,7 @@ class VisionPreview
           last_seq = stream->frame_seq;
           frame = stream->latest_frame;
         }
-        if (frame.empty())
+        if (!frame || frame->empty())
         {
           continue;
         }
@@ -1122,10 +1155,11 @@ class VisionPreview
         std::ostringstream part_header;
         part_header << "--frame\r\n"
                     << "Content-Type: image/bmp\r\n"
-                    << "Content-Length: " << frame.size() << "\r\n\r\n";
+                    << "Content-Length: " << frame->size() << "\r\n\r\n";
         const std::string part = part_header.str();
         if (!SendAll(client_fd, part.data(), part.size()) ||
-            !SendAll(client_fd, reinterpret_cast<const char*>(frame.data()), frame.size()) ||
+            !SendAll(client_fd, reinterpret_cast<const char*>(frame->data()),
+                     frame->size()) ||
             !SendAll(client_fd, "\r\n", 2))
         {
           break;
@@ -1247,6 +1281,8 @@ class VisionPreview
   std::thread worker_thread_{};
   /// 预览线程运行标志。
   std::atomic<bool> running_{false};
+  /// Stop/Start 生命周期标识，阻止旧会话中仍在拷图的 Submit 跨会话入队。
+  std::atomic<uint64_t> session_token_{0};
   /// 队列满丢弃计数。
   std::atomic<uint32_t> dropped_frames_{0};
   /// 限频丢弃计数。
