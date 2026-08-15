@@ -1,0 +1,7 @@
+add_executable(vision_preview_restart_test vision_preview_restart_test.cpp)
+
+find_package(Threads REQUIRED)
+target_link_libraries(vision_preview_restart_test PRIVATE xr Threads::Threads)
+target_compile_features(vision_preview_restart_test PRIVATE cxx_std_20)
+
+add_test(NAME vision_preview_restart_test COMMAND vision_preview_restart_test)
