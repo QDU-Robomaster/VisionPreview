@@ -33,12 +33,14 @@ depends: []
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -119,56 +121,104 @@ class VisionPreview
    */
   bool Start(RuntimeParam runtime)
   {
+    LifecycleTransition transition(*this);
+    if (!transition)
+    {
+      return Running();
+    }
+
     if (Running())
     {
       return true;
     }
 
-    runtime_ = runtime;
-    preview_window_name_ = std::string(runtime.preview_window_name);
-    output_mode_ = std::string(runtime.output_mode);
-    web_bind_address_ = std::string(runtime.web_bind_address);
-    web_stream_name_ =
-        NormalizeStreamName(runtime.web_stream_name.empty() ? runtime.preview_window_name
-                                                            : runtime.web_stream_name);
-    dropped_frames_.store(0, std::memory_order_relaxed);
-    rate_dropped_frames_.store(0, std::memory_order_relaxed);
-    accepted_frames_.store(0, std::memory_order_relaxed);
-    ConfigureRateLimit(runtime.max_fps);
-    if (!ShouldRun())
+    if (worker_thread_.joinable())
     {
-      return false;
-    }
-    if (!WindowMode() && !WebMode())
-    {
-      XR_LOG_ERROR("VisionPreview disabled: unsupported output_mode=%s name=%s",
-                   output_mode_.c_str(), preview_window_name_.c_str());
-      return false;
+      if (worker_thread_.get_id() == std::this_thread::get_id())
+      {
+        XR_LOG_ERROR("VisionPreview cannot restart from its worker thread name=%s",
+                     preview_window_name_.c_str());
+        return false;
+      }
+      worker_thread_.join();
+      SetWorkerThreadId({});
     }
 
-    if (WindowMode() && !UiAvailable())
+    try
     {
-      XR_LOG_WARN("VisionPreview disabled: display backend unavailable window=%s",
-                  preview_window_name_.c_str());
-      return false;
-    }
-
-    queue_capacity_ = runtime.queue_capacity == 0 ? 1U : runtime.queue_capacity;
-    queue_capacity_ = std::min<std::size_t>(queue_capacity_, 2U);
-    ClearQueuedJobs();
-    session_token_.fetch_add(1, std::memory_order_acq_rel);
-    running_.store(true, std::memory_order_release);
-    if (WebMode() && !StartWebStream())
-    {
-      running_.store(false, std::memory_order_release);
-      session_token_.fetch_add(1, std::memory_order_acq_rel);
       ClearQueuedJobs();
-      XR_LOG_ERROR("VisionPreview failed to start web stream name=%s bind=%s port=%u",
-                   web_stream_name_.c_str(), web_bind_address_.c_str(),
-                   static_cast<unsigned>(runtime_.web_port));
+      StopWebStream();
+      runtime_ = runtime;
+      preview_window_name_ = std::string(runtime.preview_window_name);
+      output_mode_ = std::string(runtime.output_mode);
+      web_bind_address_ = std::string(runtime.web_bind_address);
+      web_stream_name_ = NormalizeStreamName(runtime.web_stream_name.empty()
+                                                 ? runtime.preview_window_name
+                                                 : runtime.web_stream_name);
+      dropped_frames_.store(0, std::memory_order_relaxed);
+      rate_dropped_frames_.store(0, std::memory_order_relaxed);
+      accepted_frames_.store(0, std::memory_order_relaxed);
+      ConfigureRateLimit(runtime.max_fps);
+      if (!ShouldRun())
+      {
+        return false;
+      }
+      if (!WindowMode() && !WebMode())
+      {
+        XR_LOG_ERROR("VisionPreview disabled: unsupported output_mode=%s name=%s",
+                     output_mode_.c_str(), preview_window_name_.c_str());
+        return false;
+      }
+
+      if (WindowMode() && !UiAvailable())
+      {
+        XR_LOG_WARN("VisionPreview disabled: display backend unavailable window=%s",
+                    preview_window_name_.c_str());
+        return false;
+      }
+
+      queue_capacity_ = runtime.queue_capacity == 0 ? 1U : runtime.queue_capacity;
+      queue_capacity_ = std::min<std::size_t>(queue_capacity_, 2U);
+      ClearQueuedJobs();
+      session_token_.fetch_add(1, std::memory_order_acq_rel);
+      running_.store(true, std::memory_order_release);
+      if (WebMode() && !StartWebStream())
+      {
+        RollbackFailedStart();
+        XR_LOG_ERROR("VisionPreview failed to start web stream name=%s bind=%s port=%u",
+                     web_stream_name_.c_str(), web_bind_address_.c_str(),
+                     static_cast<unsigned>(runtime_.web_port));
+        return false;
+      }
+#if defined(VISION_PREVIEW_TESTING)
+      if (fail_next_worker_start_with_bad_alloc_for_test_.exchange(
+              false, std::memory_order_acq_rel))
+      {
+        throw std::bad_alloc();
+      }
+      if (fail_next_worker_start_for_test_.exchange(false, std::memory_order_acq_rel))
+      {
+        throw std::system_error(
+            std::make_error_code(std::errc::resource_unavailable_try_again));
+      }
+#endif
+      worker_thread_ = std::thread(WorkerThreadMain, this);
+      SetWorkerThreadId(worker_thread_.get_id());
+    }
+    catch (const std::exception& error)
+    {
+      RollbackFailedStart();
+      XR_LOG_ERROR("VisionPreview start failed name=%s error=%s",
+                   preview_window_name_.c_str(), error.what());
       return false;
     }
-    worker_thread_ = std::thread(WorkerThreadMain, this);
+    catch (...)
+    {
+      RollbackFailedStart();
+      XR_LOG_ERROR("VisionPreview start failed name=%s error=unknown",
+                   preview_window_name_.c_str());
+      return false;
+    }
     XR_LOG_INFO("VisionPreview started mode=%s name=%s bind=%s port=%u max_fps=%.2f",
                 output_mode_.c_str(), preview_window_name_.c_str(),
                 web_bind_address_.c_str(), static_cast<unsigned>(runtime_.web_port),
@@ -266,6 +316,12 @@ class VisionPreview
    */
   void Stop()
   {
+    LifecycleTransition transition(*this);
+    if (!transition)
+    {
+      return;
+    }
+
     const bool was_running = running_.exchange(false, std::memory_order_acq_rel);
     session_token_.fetch_add(1, std::memory_order_acq_rel);
     cv_.notify_all();
@@ -281,17 +337,101 @@ class VisionPreview
         worker_thread_.get_id() != std::this_thread::get_id())
     {
       worker_thread_.join();
+      SetWorkerThreadId({});
     }
     ClearQueuedJobs();
-    if (web_server_ && web_stream_)
-    {
-      web_server_->UnregisterStream(web_stream_);
-    }
-    web_stream_.reset();
-    web_server_.reset();
+    StopWebStream();
   }
 
  private:
+  /**
+   * @brief 串行化一次 Start/Stop，并在作用域结束时唤醒等待者。
+   */
+  class LifecycleTransition
+  {
+   public:
+    explicit LifecycleTransition(VisionPreview& owner)
+        : owner_(owner), acquired_(owner_.BeginLifecycleTransition())
+    {
+    }
+
+    ~LifecycleTransition()
+    {
+      if (acquired_)
+      {
+        owner_.EndLifecycleTransition();
+      }
+    }
+
+    LifecycleTransition(const LifecycleTransition&) = delete;
+    LifecycleTransition& operator=(const LifecycleTransition&) = delete;
+
+    explicit operator bool() const { return acquired_; }
+
+   private:
+    VisionPreview& owner_;
+    bool acquired_;
+  };
+
+  /**
+   * @brief 进入一次生命周期切换。
+   *
+   * worker 回调不能等待正在 join 自己的外部切换，因此该场景直接拒绝重入。
+   */
+  bool BeginLifecycleTransition()
+  {
+    std::unique_lock<std::mutex> lock(lifecycle_mutex_);
+    while (lifecycle_transition_)
+    {
+      if (worker_thread_id_ == std::this_thread::get_id())
+      {
+        return false;
+      }
+      lifecycle_cv_.wait(lock);
+    }
+    lifecycle_transition_ = true;
+    return true;
+  }
+
+  /**
+   * @brief 完成一次生命周期切换。
+   */
+  void EndLifecycleTransition()
+  {
+    {
+      std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+      lifecycle_transition_ = false;
+    }
+    lifecycle_cv_.notify_all();
+  }
+
+  /**
+   * @brief 更新用于识别 worker 重入的线程 ID。
+   */
+  void SetWorkerThreadId(std::thread::id thread_id)
+  {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    worker_thread_id_ = thread_id;
+  }
+
+  /**
+   * @brief 回滚一次尚未提交的 Start 事务。
+   */
+  void RollbackFailedStart()
+  {
+    running_.store(false, std::memory_order_release);
+    session_token_.fetch_add(1, std::memory_order_acq_rel);
+    cv_.notify_all();
+    if (worker_thread_.joinable() &&
+        worker_thread_.get_id() != std::this_thread::get_id())
+    {
+      worker_thread_.join();
+      SetWorkerThreadId({});
+    }
+    ClearQueuedJobs();
+    StopWebStream();
+  }
+
   struct Job
   {
     /// 预览线程持有的图像拷贝。
@@ -439,17 +579,43 @@ class VisionPreview
   /**
    * @brief 预览线程入口。
    */
-  static void WorkerThreadMain(VisionPreview* self)
+  static void WorkerThreadMain(VisionPreview* self) noexcept
   {
-    while (self->running_.load(std::memory_order_acquire))
+    try
     {
-      Job job;
-      if (!self->Pop(job))
+      while (self->running_.load(std::memory_order_acquire))
       {
-        break;
+        Job job;
+        if (!self->Pop(job))
+        {
+          break;
+        }
+        self->Process(job);
       }
-      self->Process(job);
     }
+    catch (const std::exception& error)
+    {
+      self->HandleWorkerFailure(error.what());
+    }
+    catch (...)
+    {
+      self->HandleWorkerFailure("unknown");
+    }
+  }
+
+  /**
+   * @brief Convert an escaped worker exception into a stopped, restartable session.
+   *
+   * The next Start() or Stop() joins this worker and releases the previous output
+   * resources.
+   */
+  void HandleWorkerFailure(const char* error) noexcept
+  {
+    running_.store(false, std::memory_order_release);
+    session_token_.fetch_add(1, std::memory_order_acq_rel);
+    cv_.notify_all();
+    XR_LOG_ERROR("VisionPreview worker failed name=%s error=%s",
+                 preview_window_name_.c_str(), error);
   }
 
   /**
@@ -663,34 +829,73 @@ class VisionPreview
   {
    public:
     /**
-     * @brief 获取或创建指定地址和端口的服务器。
+     * @brief 原子获取服务器并注册 stream。
+     *
+     * RegistryMutex 始终先于 streams_mutex_ 获取，保证 Acquire 不会返回一个正在
+     * 退役的 server。
      */
-    static std::shared_ptr<WebServer> Acquire(std::string bind_address, uint16_t port)
+    static bool AcquireAndRegister(std::string bind_address, uint16_t port,
+                                   const std::string& stream_name,
+                                   std::shared_ptr<WebServer>& server_out,
+                                   std::shared_ptr<WebStream>& stream_out)
     {
 #if defined(_WIN32)
       (void)bind_address;
       (void)port;
-      return nullptr;
+      (void)stream_name;
+      (void)server_out;
+      (void)stream_out;
+      return false;
 #else
       const std::string key = bind_address + ":" + std::to_string(port);
       std::lock_guard<std::mutex> lock(RegistryMutex());
-      if (auto existing = Registry()[key].lock())
+      std::shared_ptr<WebServer> server;
+      auto registry_it = Registry().find(key);
+      if (registry_it != Registry().end())
       {
-        XR_LOG_INFO("VisionPreview web server reused bind=%s port=%u",
-                    bind_address.c_str(), static_cast<unsigned>(port));
-        return existing;
+        server = registry_it->second.lock();
+        if (!server)
+        {
+          Registry().erase(registry_it);
+        }
       }
 
-      auto server =
-          std::shared_ptr<WebServer>(new WebServer(std::move(bind_address), port));
-      if (!server->Start())
+      const bool created = !server;
+      if (created)
       {
-        XR_LOG_ERROR("VisionPreview web server start failed bind=%s port=%u",
-                     server->bind_address_.c_str(), static_cast<unsigned>(server->port_));
-        return nullptr;
+        server =
+            std::shared_ptr<WebServer>(new WebServer(std::move(bind_address), port, key));
+        if (!server->Start())
+        {
+          XR_LOG_ERROR("VisionPreview web server start failed bind=%s port=%u",
+                       server->bind_address_.c_str(),
+                       static_cast<unsigned>(server->port_));
+          return false;
+        }
       }
-      Registry()[key] = server;
-      return server;
+
+      auto stream = server->RegisterStream(stream_name);
+      if (!stream)
+      {
+        if (created)
+        {
+          server->Stop();
+        }
+        return false;
+      }
+
+      if (created)
+      {
+        Registry().emplace(key, server);
+      }
+      else
+      {
+        XR_LOG_INFO("VisionPreview web server reused bind=%s port=%u",
+                    server->bind_address_.c_str(), static_cast<unsigned>(server->port_));
+      }
+      server_out = std::move(server);
+      stream_out = std::move(stream);
+      return true;
 #endif
     }
 
@@ -718,7 +923,7 @@ class VisionPreview
     }
 
     /**
-     * @brief 注销预览流；最后一个流注销后停止服务器。
+     * @brief 注销预览流；最后一个流会在 registry 锁内完整退役 server。
      */
     void UnregisterStream(const std::shared_ptr<WebStream>& stream)
     {
@@ -727,30 +932,116 @@ class VisionPreview
         return;
       }
 
-      bool empty = false;
+      std::lock_guard<std::mutex> registry_lock(RegistryMutex());
+      bool retire = false;
       {
-        std::lock_guard<std::mutex> lock(streams_mutex_);
-        auto it = streams_.find(stream->name);
-        if (it != streams_.end() && it->second == stream)
+        std::lock_guard<std::mutex> streams_lock(streams_mutex_);
+        auto stream_it = streams_.find(stream->name);
+        if (stream_it != streams_.end() && stream_it->second == stream)
         {
-          streams_.erase(it);
+          streams_.erase(stream_it);
+          retire = streams_.empty();
           XR_LOG_INFO("VisionPreview stream unregistered: /stream/%s",
                       stream->name.c_str());
         }
-        empty = streams_.empty();
       }
       stream->Close();
-      if (empty)
+      if (!retire)
       {
-        XR_LOG_INFO("VisionPreview web server stopping: no active streams");
-        Stop();
+        return;
       }
+
+      auto registry_it = Registry().find(registry_key_);
+      if (registry_it != Registry().end())
+      {
+        auto registered = registry_it->second.lock();
+        if (!registered || registered.get() == this)
+        {
+          Registry().erase(registry_it);
+        }
+      }
+      XR_LOG_INFO("VisionPreview web server retiring: no active streams");
+      Stop();
     }
 
    private:
-    WebServer(std::string bind_address, uint16_t port)
-        : bind_address_(std::move(bind_address)), port_(port)
+    friend struct VisionPreviewTestAccess;
+
+    class ClientConnection
     {
+     public:
+      explicit ClientConnection(int fd) : fd_(fd) {}
+
+      ~ClientConnection() { Close(); }
+
+      ClientConnection(const ClientConnection&) = delete;
+      ClientConnection& operator=(const ClientConnection&) = delete;
+
+      int FileDescriptor() const
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return fd_;
+      }
+
+      void Shutdown()
+      {
+#if !defined(_WIN32)
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (fd_ >= 0)
+        {
+          (void)::shutdown(fd_, SHUT_RDWR);
+        }
+#endif
+      }
+
+      void Close()
+      {
+#if !defined(_WIN32)
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (fd_ >= 0)
+        {
+          (void)::shutdown(fd_, SHUT_RDWR);
+          (void)::close(fd_);
+          fd_ = -1;
+        }
+#endif
+      }
+
+#if defined(VISION_PREVIEW_TESTING)
+      void SetLargeSendInProgress(bool active)
+      {
+        large_send_in_progress_.store(active, std::memory_order_release);
+      }
+
+      bool LargeSendInProgress() const
+      {
+        return large_send_in_progress_.load(std::memory_order_acquire);
+      }
+#endif
+
+     private:
+      mutable std::mutex mutex_;
+      int fd_{-1};
+#if defined(VISION_PREVIEW_TESTING)
+      std::atomic<bool> large_send_in_progress_{false};
+#endif
+    };
+
+    struct ClientThread
+    {
+      std::thread thread;
+      std::shared_ptr<std::atomic<bool>> completed;
+      std::shared_ptr<ClientConnection> connection;
+    };
+
+    static constexpr std::size_t kMaxClientThreads = 16U;
+
+    WebServer(std::string bind_address, uint16_t port, std::string registry_key)
+        : bind_address_(std::move(bind_address)),
+          port_(port),
+          registry_key_(std::move(registry_key))
+    {
+      client_threads_.reserve(kMaxClientThreads);
     }
 
     /**
@@ -820,7 +1111,18 @@ class VisionPreview
 
       server_fd_.store(fd, std::memory_order_release);
       running_.store(true, std::memory_order_release);
-      server_thread_ = std::thread(ServerThreadMain, this);
+      try
+      {
+        server_thread_ = std::thread(ServerThreadMain, this);
+      }
+      catch (const std::system_error& error)
+      {
+        running_.store(false, std::memory_order_release);
+        CloseServerSocket(server_fd_.exchange(-1, std::memory_order_acq_rel));
+        XR_LOG_ERROR("VisionPreview web server thread start failed error=%d",
+                     error.code().value());
+        return false;
+      }
       XR_LOG_PASS("VisionPreview web server listening bind=%s port=%u",
                   bind_address_.c_str(), static_cast<unsigned>(port_));
       return true;
@@ -838,28 +1140,46 @@ class VisionPreview
         return;
       }
 
-      CloseServerSocket();
+      const int server_fd = server_fd_.exchange(-1, std::memory_order_acq_rel);
+      ShutdownServerSocket(server_fd);
       NotifyStreamsClosed();
       if (server_thread_.joinable() &&
           server_thread_.get_id() != std::this_thread::get_id())
       {
         server_thread_.join();
       }
+      CloseServerSocket(server_fd);
+      ShutdownClientConnections();
       JoinClientThreads();
     }
 
     /**
-     * @brief 关闭监听 socket。
+     * @brief 中断监听 socket；所有权保留到 accept 线程退出，避免 fd 被提前复用。
      */
-    void CloseServerSocket()
+    static void ShutdownServerSocket(int fd) noexcept
     {
 #if !defined(_WIN32)
-      const int fd = server_fd_.exchange(-1, std::memory_order_acq_rel);
       if (fd >= 0)
       {
         (void)::shutdown(fd, SHUT_RDWR);
+      }
+#else
+      (void)fd;
+#endif
+    }
+
+    /**
+     * @brief 关闭已经不再被 accept 线程访问的监听 socket。
+     */
+    static void CloseServerSocket(int fd) noexcept
+    {
+#if !defined(_WIN32)
+      if (fd >= 0)
+      {
         (void)::close(fd);
       }
+#else
+      (void)fd;
 #endif
     }
 
@@ -888,6 +1208,7 @@ class VisionPreview
 #if !defined(_WIN32)
       while (running_.load(std::memory_order_acquire))
       {
+        ReapClientThreads();
         const int fd = server_fd_.load(std::memory_order_acquire);
         if (fd < 0)
         {
@@ -912,9 +1233,16 @@ class VisionPreview
         {
           continue;
         }
+        if (!running_.load(std::memory_order_acquire))
+        {
+          (void)::shutdown(client_fd, SHUT_RDWR);
+          (void)::close(client_fd);
+          break;
+        }
         XR_LOG_INFO("VisionPreview web client connected fd=%d", client_fd);
         AddClientThread(client_fd);
       }
+      ReapClientThreads();
 #endif
     }
 
@@ -923,8 +1251,111 @@ class VisionPreview
      */
     void AddClientThread(int client_fd)
     {
-      std::lock_guard<std::mutex> lock(client_threads_mutex_);
-      client_threads_.emplace_back(ClientThreadMain, this, client_fd);
+      ReapClientThreads();
+      std::shared_ptr<ClientConnection> connection;
+      std::shared_ptr<std::atomic<bool>> completed;
+      try
+      {
+        connection = std::make_shared<ClientConnection>(client_fd);
+        completed = std::make_shared<std::atomic<bool>>(false);
+      }
+      catch (...)
+      {
+#if !defined(_WIN32)
+        if (connection)
+        {
+          connection->Close();
+        }
+        else
+        {
+          (void)::shutdown(client_fd, SHUT_RDWR);
+          (void)::close(client_fd);
+        }
+#endif
+        XR_LOG_ERROR("VisionPreview web client state allocation failed");
+        return;
+      }
+
+      bool rejected = false;
+      int start_error = 0;
+      {
+        std::lock_guard<std::mutex> lock(client_threads_mutex_);
+        if (client_threads_.size() >= kMaxClientThreads)
+        {
+          rejected = true;
+        }
+        else
+        {
+          client_threads_.emplace_back();
+          ClientThread& client = client_threads_.back();
+          client.completed = completed;
+          client.connection = connection;
+          try
+          {
+            client.thread = std::thread(ClientThreadMain, this, connection, completed);
+          }
+          catch (const std::exception& error)
+          {
+            start_error = 1;
+            XR_LOG_ERROR("VisionPreview web client thread start failed error=%s",
+                         error.what());
+            client_threads_.pop_back();
+          }
+          catch (...)
+          {
+            start_error = 1;
+            XR_LOG_ERROR("VisionPreview web client thread start failed error=unknown");
+            client_threads_.pop_back();
+          }
+        }
+      }
+
+      if (!rejected && start_error == 0)
+      {
+        return;
+      }
+
+      connection->Close();
+      if (rejected)
+      {
+        XR_LOG_WARN("VisionPreview web client rejected: limit=%u",
+                    static_cast<unsigned>(kMaxClientThreads));
+      }
+    }
+
+    /**
+     * @brief 回收已经完成的客户端线程。
+     */
+    void ReapClientThreads()
+    {
+      while (true)
+      {
+        std::thread completed_thread;
+        {
+          std::lock_guard<std::mutex> lock(client_threads_mutex_);
+          std::size_t index = 0;
+          while (index < client_threads_.size() &&
+                 !client_threads_[index].completed->load(std::memory_order_acquire))
+          {
+            ++index;
+          }
+          if (index == client_threads_.size())
+          {
+            return;
+          }
+
+          completed_thread = std::move(client_threads_[index].thread);
+          if (index + 1U != client_threads_.size())
+          {
+            client_threads_[index] = std::move(client_threads_.back());
+          }
+          client_threads_.pop_back();
+        }
+        if (completed_thread.joinable())
+        {
+          completed_thread.join();
+        }
+      }
     }
 
     /**
@@ -932,17 +1363,33 @@ class VisionPreview
      */
     void JoinClientThreads()
     {
-      std::vector<std::thread> threads;
+      std::vector<ClientThread> clients;
       {
         std::lock_guard<std::mutex> lock(client_threads_mutex_);
-        threads.swap(client_threads_);
+        clients.swap(client_threads_);
       }
 
-      for (auto& thread : threads)
+      for (auto& client : clients)
       {
-        if (thread.joinable() && thread.get_id() != std::this_thread::get_id())
+        if (client.thread.joinable() &&
+            client.thread.get_id() != std::this_thread::get_id())
         {
-          thread.join();
+          client.thread.join();
+        }
+      }
+    }
+
+    /**
+     * @brief 中断全部已 accept 的客户端 I/O，使随后的 join 有界完成。
+     */
+    void ShutdownClientConnections()
+    {
+      std::lock_guard<std::mutex> lock(client_threads_mutex_);
+      for (const auto& client : client_threads_)
+      {
+        if (client.connection)
+        {
+          client.connection->Shutdown();
         }
       }
     }
@@ -950,18 +1397,45 @@ class VisionPreview
     /**
      * @brief 客户端处理线程入口。
      */
-    static void ClientThreadMain(WebServer* self, int client_fd)
+    static void ClientThreadMain(WebServer* self,
+                                 const std::shared_ptr<ClientConnection>& connection,
+                                 const std::shared_ptr<std::atomic<bool>>& completed)
     {
-      self->HandleClient(client_fd);
+      try
+      {
+        self->HandleClient(connection);
+      }
+      catch (const std::exception& error)
+      {
+        XR_LOG_ERROR("VisionPreview web client failed error=%s", error.what());
+      }
+      catch (...)
+      {
+        XR_LOG_ERROR("VisionPreview web client failed error=unknown");
+      }
+      connection->Close();
+      completed->store(true, std::memory_order_release);
     }
 
     /**
      * @brief 解析请求并返回首页、404 或 multipart stream。
      */
-    void HandleClient(int client_fd)
+    void HandleClient(const std::shared_ptr<ClientConnection>& connection)
     {
 #if !defined(_WIN32)
+      const int client_fd = connection->FileDescriptor();
+      if (client_fd < 0)
+      {
+        return;
+      }
+#if defined(VISION_PREVIEW_TESTING)
+      timeval timeout{5, 0};
+      int send_buffer_size = 4096;
+      (void)::setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &send_buffer_size,
+                         sizeof(send_buffer_size));
+#else
       timeval timeout{1, 0};
+#endif
       (void)::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
       (void)::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
@@ -969,8 +1443,7 @@ class VisionPreview
       const std::string path = ParseRequestPath(request);
       if (path == "/" || path == "/index.html")
       {
-        SendIndexPage(client_fd);
-        ::close(client_fd);
+        SendIndexPage(connection);
         return;
       }
 
@@ -983,17 +1456,15 @@ class VisionPreview
             "Connection: close\r\n"
             "Content-Type: text/plain\r\n\r\n"
             "stream not found\n";
-        (void)SendAll(client_fd, not_found.data(), not_found.size());
-        ::close(client_fd);
+        (void)SendAll(connection, not_found.data(), not_found.size());
         return;
       }
 
-      StreamMultipart(client_fd, stream);
+      StreamMultipart(connection, stream);
       XR_LOG_INFO("VisionPreview web client disconnected stream=%s",
                   stream->name.c_str());
-      ::close(client_fd);
 #else
-      (void)client_fd;
+      (void)connection;
 #endif
     }
 
@@ -1075,7 +1546,7 @@ class VisionPreview
     /**
      * @brief 返回列出所有 stream 的简单 HTML 页面。
      */
-    bool SendIndexPage(int client_fd)
+    bool SendIndexPage(const std::shared_ptr<ClientConnection>& connection)
     {
       std::ostringstream body;
       body << "<!doctype html><html><head><meta charset=\"utf-8\">"
@@ -1106,13 +1577,14 @@ class VisionPreview
                << "Content-Length: " << body_str.size() << "\r\n\r\n"
                << body_str;
       const std::string data = response.str();
-      return SendAll(client_fd, data.data(), data.size());
+      return SendAll(connection, data.data(), data.size());
     }
 
     /**
      * @brief 按 multipart/x-mixed-replace 输出 BMP 帧。
      */
-    void StreamMultipart(int client_fd, const std::shared_ptr<WebStream>& stream)
+    void StreamMultipart(const std::shared_ptr<ClientConnection>& connection,
+                         const std::shared_ptr<WebStream>& stream)
     {
       static constexpr std::string_view header =
           "HTTP/1.1 200 OK\r\n"
@@ -1120,7 +1592,7 @@ class VisionPreview
           "Cache-Control: no-cache, no-store, must-revalidate\r\n"
           "Pragma: no-cache\r\n"
           "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-      if (!SendAll(client_fd, header.data(), header.size()))
+      if (!SendAll(connection, header.data(), header.size()))
       {
         return;
       }
@@ -1157,10 +1629,10 @@ class VisionPreview
                     << "Content-Type: image/bmp\r\n"
                     << "Content-Length: " << frame->size() << "\r\n\r\n";
         const std::string part = part_header.str();
-        if (!SendAll(client_fd, part.data(), part.size()) ||
-            !SendAll(client_fd, reinterpret_cast<const char*>(frame->data()),
+        if (!SendAll(connection, part.data(), part.size()) ||
+            !SendAll(connection, reinterpret_cast<const char*>(frame->data()),
                      frame->size()) ||
-            !SendAll(client_fd, "\r\n", 2))
+            !SendAll(connection, "\r\n", 2))
         {
           break;
         }
@@ -1170,9 +1642,34 @@ class VisionPreview
     /**
      * @brief 阻塞发送完整缓冲区。
      */
-    static bool SendAll(int fd, const char* data, std::size_t size)
+    static bool SendAll(const std::shared_ptr<ClientConnection>& connection,
+                        const char* data, std::size_t size)
     {
 #if !defined(_WIN32)
+      const int fd = connection->FileDescriptor();
+      if (fd < 0)
+      {
+        return false;
+      }
+#if defined(VISION_PREVIEW_TESTING)
+      const bool large_send = size >= 1024U * 1024U;
+      if (large_send)
+      {
+        connection->SetLargeSendInProgress(true);
+      }
+      struct LargeSendGuard
+      {
+        std::shared_ptr<ClientConnection> connection;
+        bool active;
+        ~LargeSendGuard()
+        {
+          if (active)
+          {
+            connection->SetLargeSendInProgress(false);
+          }
+        }
+      } guard{connection, large_send};
+#endif
       std::size_t sent = 0;
       while (sent < size)
       {
@@ -1194,7 +1691,7 @@ class VisionPreview
       }
       return true;
 #else
-      (void)fd;
+      (void)connection;
       (void)data;
       (void)size;
       return false;
@@ -1205,6 +1702,8 @@ class VisionPreview
     std::string bind_address_;
     /// 监听端口。
     uint16_t port_{8080};
+    /// 当前 server 在全局 registry 中的键。
+    std::string registry_key_;
     /// 服务器线程是否运行。
     std::atomic<bool> running_{false};
     /// 监听 socket fd。
@@ -1218,7 +1717,7 @@ class VisionPreview
     /// 保护 client_threads_。
     std::mutex client_threads_mutex_;
     /// 当前已创建的客户端线程。
-    std::vector<std::thread> client_threads_;
+    std::vector<ClientThread> client_threads_;
   };
 
   /**
@@ -1251,21 +1750,30 @@ class VisionPreview
    */
   bool StartWebStream()
   {
-    web_server_ = WebServer::Acquire(web_bind_address_, runtime_.web_port);
-    if (!web_server_)
+    if (!WebServer::AcquireAndRegister(web_bind_address_, runtime_.web_port,
+                                       web_stream_name_, web_server_, web_stream_))
     {
-      return false;
-    }
-    web_stream_ = web_server_->RegisterStream(web_stream_name_);
-    if (!web_stream_)
-    {
-      web_server_.reset();
       return false;
     }
     XR_LOG_INFO("VisionPreview web stream ready url=/stream/%s encoding=bmp",
                 web_stream_name_.c_str());
     return true;
   }
+
+  /**
+   * @brief 注销并释放当前 web stream。
+   */
+  void StopWebStream()
+  {
+    if (web_server_ && web_stream_)
+    {
+      web_server_->UnregisterStream(web_stream_);
+    }
+    web_stream_.reset();
+    web_server_.reset();
+  }
+
+  friend struct VisionPreviewTestAccess;
 
   /// 当前运行时配置。
   RuntimeParam runtime_{};
@@ -1279,6 +1787,14 @@ class VisionPreview
   std::string web_stream_name_{"autoaim_preview"};
   /// 预览处理线程。
   std::thread worker_thread_{};
+  /// 串行化 Start/Stop 切换，但不在等待 worker 退出时持锁。
+  std::mutex lifecycle_mutex_{};
+  /// 生命周期切换完成通知。
+  std::condition_variable lifecycle_cv_{};
+  /// 当前是否有一个 Start/Stop 切换正在执行。
+  bool lifecycle_transition_{false};
+  /// 当前 worker 的线程 ID，用于避免回调重入时等待自身退出。
+  std::thread::id worker_thread_id_{};
   /// 预览线程运行标志。
   std::atomic<bool> running_{false};
   /// Stop/Start 生命周期标识，阻止旧会话中仍在拷图的 Submit 跨会话入队。
@@ -1309,4 +1825,10 @@ class VisionPreview
   std::shared_ptr<WebServer> web_server_{};
   /// 当前实例注册的 web stream。
   std::shared_ptr<WebStream> web_stream_{};
+#if defined(VISION_PREVIEW_TESTING)
+  /// 测试专用：令下一次 worker 创建按资源不足失败。
+  std::atomic<bool> fail_next_worker_start_for_test_{false};
+  /// 测试专用：令下一次 worker 创建前抛出 bad_alloc。
+  std::atomic<bool> fail_next_worker_start_with_bad_alloc_for_test_{false};
+#endif
 };
