@@ -61,5 +61,9 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build
+          cmake -S . -B build -DBUILD_TESTING=ON
           cmake --build build -j$(nproc)
+
+      - name: Test
+        run: |
+          ctest --test-dir build/libxr --output-on-failure --no-tests=error

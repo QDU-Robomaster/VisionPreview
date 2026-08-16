@@ -3,5 +3,7 @@ add_executable(vision_preview_restart_test vision_preview_restart_test.cpp)
 find_package(Threads REQUIRED)
 target_link_libraries(vision_preview_restart_test PRIVATE xr Threads::Threads)
 target_compile_features(vision_preview_restart_test PRIVATE cxx_std_20)
+target_compile_definitions(vision_preview_restart_test PRIVATE VISION_PREVIEW_TESTING=1)
 
 add_test(NAME vision_preview_restart_test COMMAND vision_preview_restart_test)
+set_tests_properties(vision_preview_restart_test PROPERTIES TIMEOUT 30)
