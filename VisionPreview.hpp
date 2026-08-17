@@ -322,8 +322,7 @@ class VisionPreview
       return;
     }
 
-    const bool was_running = running_.exchange(false, std::memory_order_acq_rel);
-    session_token_.fetch_add(1, std::memory_order_acq_rel);
+    const bool was_running = MarkSessionStopped();
     cv_.notify_all();
     if (was_running)
     {
@@ -415,12 +414,25 @@ class VisionPreview
   }
 
   /**
+   * @brief 在队列锁内把当前会话标记为停止。
+   *
+   * running_ 是 Pop() 的等待谓词；状态更新必须与 mutex_ 同步，避免通知发生在
+   * worker 完成谓词检查之后、真正进入等待之前。
+   */
+  bool MarkSessionStopped()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const bool was_running = running_.exchange(false, std::memory_order_acq_rel);
+    session_token_.fetch_add(1, std::memory_order_acq_rel);
+    return was_running;
+  }
+
+  /**
    * @brief 回滚一次尚未提交的 Start 事务。
    */
   void RollbackFailedStart()
   {
-    running_.store(false, std::memory_order_release);
-    session_token_.fetch_add(1, std::memory_order_acq_rel);
+    (void)MarkSessionStopped();
     cv_.notify_all();
     if (worker_thread_.joinable() &&
         worker_thread_.get_id() != std::this_thread::get_id())
@@ -611,8 +623,7 @@ class VisionPreview
    */
   void HandleWorkerFailure(const char* error) noexcept
   {
-    running_.store(false, std::memory_order_release);
-    session_token_.fetch_add(1, std::memory_order_acq_rel);
+    (void)MarkSessionStopped();
     cv_.notify_all();
     XR_LOG_ERROR("VisionPreview worker failed name=%s error=%s",
                  preview_window_name_.c_str(), error);
