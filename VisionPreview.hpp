@@ -3,20 +3,8 @@
 // clang-format off
 /* === MODULE MANIFEST V2 ===
 module_description: 实时视觉预览输出工具
-constructor_args:
-  runtime:
-    enabled: false
-    preview_window_name: autoaim_preview
-    preview_scale: 1.0
-    preview_wait_key_ms: 1
-    queue_capacity: 1
-    output_mode: window
-    web_bind_address: 0.0.0.0
-    web_port: 8080
-    web_stream_name: ""
-    max_fps: 30.0
-required_hardware: []
 depends: []
+standalone: false
 === END MANIFEST === */
 // clang-format on
 

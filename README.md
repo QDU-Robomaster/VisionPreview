@@ -1,5 +1,16 @@
 # VisionPreview
 
+## Static assembly source line
+
+This source line uses explicit C++ constructor dependencies and ordered instance
+arguments. Inspect the current primary header with `xrobot_mod_parser --path .`;
+its declarations, not old manifest/config examples, define the interface.
+Historical HardwareContainer/ApplicationManager examples below apply only to the
+older dynamic source tags. Device/protocol descriptions remain relevant.
+See the XRobot [migration guide](https://github.com/xrobot-org/XRobot/blob/dev/MIGRATION.md).
+Compilation is not hardware validation; retain version-specific board evidence.
+
+
 `VisionPreview` 用于实时查看视觉模块输出的画面。调用方提交一帧 OpenCV 图像和绘制
 函数，预览线程在图像拷贝上绘制内容，然后输出到 OpenCV 窗口或浏览器。
 

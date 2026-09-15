@@ -6,6 +6,9 @@ on:
   schedule:
     - cron: '0 3 1 * *'
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,11 +21,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: Modules/VisionPreview
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Pull libxr
         run: |
-          git clone --depth=1 --branch master \
-            https://github.com/Jiu-xiao/libxr ./libxr
+          git clone --depth=1 --branch feat/static-assembly-20260915 \
+            https://github.com/xrobot-org/libxr ./libxr
+          git -C libxr fetch --depth=1 origin f1a3479f6f6a9f3eb5368a93bc5298064e8e2ad8
+          git -C libxr checkout --detach f1a3479f6f6a9f3eb5368a93bc5298064e8e2ad8
 
       - name: Create compile smoke test
         run: |
@@ -44,6 +50,8 @@ jobs:
           project(vision_preview_smoke CXX)
           set(CMAKE_CXX_STANDARD 20)
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          set(LIBXR_PRINT_INTEGER_ENABLE_64BIT ON)
+          set(LIBXR_PRINT_FLOAT_ENABLE_DOUBLE ON)
           set(XROBOT_MODULES_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Modules/)
           set(WEBOTS_HOME /usr/local/webots)
           add_executable(vision_preview_smoke main.cpp)
@@ -62,7 +70,7 @@ jobs:
       - name: Build
         run: |
           cmake -S . -B build -DBUILD_TESTING=ON
-          cmake --build build -j$(nproc)
+          cmake --build build --parallel 2
 
       - name: Test
         run: |
