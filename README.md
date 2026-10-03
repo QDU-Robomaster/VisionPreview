@@ -39,12 +39,7 @@ http://<host>:<web_port>/stream/<web_stream_name>
 
 `output_mode: "window"` uses an OpenCV window and requires `DISPLAY` or `WAYLAND_DISPLAY` in the environment; the preview does not start when both are missing.
 
-`output_mode: "raw"`, `"bmp"`, `"web"` and `"http"` start the built-in HTTP service (non-Windows platforms). Each frame is encoded as an uncompressed 24-bit BMP and pushed as `multipart/x-mixed-replace`; the browser opens:
-
-```text
-http://<host>:<web_port>/
-http://<host>:<web_port>/stream/<web_stream_name>
-```
+`output_mode: "raw"`, `"bmp"`, `"web"` and `"http"` start the built-in HTTP service (non-Windows platforms). Each frame is encoded as an uncompressed 24-bit BMP and pushed as `multipart/x-mixed-replace`; the browser opens the addresses in the code block above.
 
 Several `VisionPreview` instances in one process share one `web_bind_address:web_port`. Each instance registers its own stream, and the stream names differ. The root path lists all current streams; `/stream` is also available when there is only one stream. Each service serves at most 16 clients at the same time; the service shuts down after the last stream is unregistered.
 
