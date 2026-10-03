@@ -2,7 +2,7 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: 实时视觉预览输出工具
+module_description: 实时视觉预览库：异步绘制并输出到 OpenCV 窗口或浏览器 / Real-time vision preview library that draws asynchronously and outputs to an OpenCV window or a browser
 depends: []
 standalone: false
 === END MANIFEST === */
@@ -1796,7 +1796,7 @@ class VisionPreview
   std::thread::id worker_thread_id_{};
   /// 预览线程运行标志。
   std::atomic<bool> running_{false};
-  /// Stop/Start 生命周期标识，阻止旧会话中仍在拷图的 Submit 跨会话入队。
+  /// Stop/Start 生命周期标识，阻止上一会话中仍在拷图的 Submit 跨会话入队。
   std::atomic<uint64_t> session_token_{0};
   /// 队列满丢弃计数。
   std::atomic<uint32_t> dropped_frames_{0};
