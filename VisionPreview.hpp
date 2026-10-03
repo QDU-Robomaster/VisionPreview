@@ -46,66 +46,86 @@ standalone: false
 
 /**
  * @brief 异步图像预览工具。
+ *        Asynchronous image preview tool.
  *
- * 调用方提交一帧 OpenCV 图像和一个绘制回调。`VisionPreview` 在自己的线程里执行绘制，
- * 然后输出到 OpenCV 窗口或内置 HTTP BMP 流。提交线程只负责限频、拷贝图像和入队。
+ * @details 调用方提交一帧 OpenCV 图像和一个绘制回调，`VisionPreview`
+ *          在自己的线程中执行绘制，再输出到 OpenCV 窗口或内置的 HTTP BMP 流。
+ *          提交线程负责限频、拷贝图像和入队。
+ *          The caller submits an OpenCV image and a draw callback; `VisionPreview` runs
+ *          the drawing in its own thread and outputs the result to an OpenCV window or
+ *          the built-in HTTP BMP stream. The submitting thread handles the rate limit,
+ *          the image copy and the enqueue.
  */
 class VisionPreview
 {
  public:
   /**
    * @brief 运行时配置。
+   *        Runtime configuration.
    */
   struct RuntimeParam
   {
-    /// 预览总开关；false 时不启动预览线程，Submit() 直接返回 false。
-    bool enabled = false;
-    /// OpenCV 窗口名；同进程内不同模块应使用不同名字。
-    std::string_view preview_window_name = "autoaim_preview";
-    /// 显示缩放比例，只影响窗口画面，不修改调用方传入的原图。
-    double preview_scale = 1.0;
-    /// cv::waitKey 的事件轮询时间，最小按 1 ms 执行。
-    int preview_wait_key_ms = 1;
-    /// 预览任务队列长度；取值会限制到 [1, 2]，队列满时丢弃等待帧。
-    std::size_t queue_capacity = 1;
-    /// 输出模式："window" 使用 OpenCV 窗口；"raw/web/http/bmp" 启动未压缩 BMP 推流。
-    std::string_view output_mode = "window";
-    /// Web 服务监听地址；实机远程查看通常用 "0.0.0.0"。
-    std::string_view web_bind_address = "0.0.0.0";
-    /// Web 服务端口；浏览器访问 http://<host>:<port>/。
-    uint16_t web_port = 8080;
-    /// Web 路由名；为空时用 preview_window_name 生成，例如
-    /// /stream/armor_detector_preview。
-    std::string_view web_stream_name = "";
-    /// 预览最大接受帧率；<= 0 表示不限频。限频在 Submit()
-    /// 入口执行，未到间隔时不拷贝图像。
-    double max_fps = 30.0;
+    bool enabled = false;  ///< 预览总开关；false 时不启动预览线程，Submit() 返回 false
+    ///< Master switch of the preview; when false no preview thread is started and
+    ///< Submit() returns false
+    std::string_view preview_window_name = "autoaim_preview";  ///< OpenCV 窗口名
+    ///< OpenCV window name
+    double preview_scale = 1.0;  ///< 显示缩放比例，作用于预览图，原图保持不变
+    ///< Display scale applied to the preview image; the original image is unchanged
+    int preview_wait_key_ms = 1;  ///< cv::waitKey 的事件轮询时间，单位 ms，最小按 1 执行
+    ///< Event polling time of cv::waitKey in ms, at least 1 is used
+    std::size_t queue_capacity = 1;  ///< 预览队列长度，限制到 [1, 2]
+    ///< Preview queue length, limited to [1, 2]; waiting frames are dropped when full
+    std::string_view output_mode = "window";  ///< 输出模式
+    ///< Output mode: "window" uses an OpenCV window; "raw", "web", "http" and "bmp" start
+    ///< an uncompressed BMP stream
+    std::string_view web_bind_address = "0.0.0.0";  ///< Web 服务监听地址
+    ///< Listen address of the Web service
+    uint16_t web_port = 8080;  ///< Web 服务端口，浏览器访问 http://<host>:<port>/
+    ///< Web service port, opened in the browser as http://<host>:<port>/
+    std::string_view web_stream_name = "";  ///< Web 路由名，为空时自动生成
+    ///< Web route name; generated from preview_window_name when empty
+    double max_fps = 30.0;  ///< 预览最大接受帧率，小于等于 0 为不限频
+    ///< Maximum accepted preview frame rate, a value less than or equal to 0 disables the
+    ///< limit; the limit is applied at the entry of Submit()
   };
 
   /**
-   * @brief 在预览线程里执行的绘制回调。
+   * @brief 在预览线程中执行的绘制回调。
+   *        Draw callback executed in the preview thread.
    */
   using DrawCallback = std::function<void(cv::Mat&)>;
 
   /**
    * @brief 构造未启动的预览对象。
+   *        Construct a preview object that is not started.
    */
   VisionPreview() = default;
 
   /**
-   * @brief 构造并启动预览对象。
+   * @brief 构造预览对象并按配置启动。
+   *        Construct a preview object and start it with the given configuration.
+   *
+   * @param runtime 运行时配置。
+   *                Runtime configuration.
    */
   explicit VisionPreview(RuntimeParam runtime) { Start(runtime); }
 
   /**
    * @brief 停止预览线程和 web stream。
+   *        Stop the preview thread and the web stream.
    */
   ~VisionPreview() { Stop(); }
 
   /**
    * @brief 按配置启动预览。
+   *        Start the preview with the given configuration.
    *
-   * @return 启动成功返回 true；配置关闭或启动失败返回 false。
+   * @param runtime 运行时配置。
+   *                Runtime configuration.
+   * @return 启动成功为 true；配置关闭或启动失败为 false。
+   *         True when started; false when the configuration is disabled or the start
+   *         failed.
    */
   bool Start(RuntimeParam runtime)
   {
@@ -216,11 +236,19 @@ class VisionPreview
 
   /**
    * @brief 查询预览线程是否正在运行。
+   *        Query whether the preview thread is running.
+   *
+   * @return 运行中为 true。
+   *         True while running.
    */
   bool Running() const { return running_.load(std::memory_order_acquire); }
 
   /**
-   * @brief 队列满时丢弃的帧数。
+   * @brief 获取队列满时丢弃的帧数。
+   *        Get the number of frames dropped because the queue was full.
+   *
+   * @return 丢弃的帧数。
+   *         Number of dropped frames.
    */
   uint32_t DroppedFrames() const
   {
@@ -228,7 +256,11 @@ class VisionPreview
   }
 
   /**
-   * @brief 因 max_fps 限频丢弃的帧数。
+   * @brief 获取因 `max_fps` 限频丢弃的帧数。
+   *        Get the number of frames dropped by the `max_fps` rate limit.
+   *
+   * @return 丢弃的帧数。
+   *         Number of dropped frames.
    */
   uint32_t RateDroppedFrames() const
   {
@@ -236,7 +268,11 @@ class VisionPreview
   }
 
   /**
-   * @brief 已接受并入队的帧数。
+   * @brief 获取已接受并入队的帧数。
+   *        Get the number of frames accepted and queued.
+   *
+   * @return 接受的帧数。
+   *         Number of accepted frames.
    */
   uint32_t AcceptedFrames() const
   {
@@ -245,10 +281,19 @@ class VisionPreview
 
   /**
    * @brief 提交一帧图像和绘制回调。
+   *        Submit an image and a draw callback.
    *
-   * 通过限频后会深拷贝 `frame`，调用方可以立即复用原图。`draw` 在预览线程里执行。
+   * @details 通过限频后深拷贝 `frame`，调用方可以立即复用原图；`draw` 在预览线程中执行。
+   *          After the rate limit is passed, `frame` is deep-copied so the caller can
+   *          reuse the original image immediately; `draw` runs in the preview thread.
    *
-   * @return 已接受入队返回 true；未运行、空图像或被限频丢弃返回 false。
+   * @param frame 待预览的图像。
+   *              Image to preview.
+   * @param draw 在图像拷贝上绘制的回调。
+   *             Callback that draws on the image copy.
+   * @return 已入队为 true；未运行、空图像、被限频或会话已切换为 false。
+   *         True when queued; false when not running, the image is empty, the rate limit
+   *         drops it or the session has changed.
    */
   bool Submit(const cv::Mat& frame, DrawCallback draw)
   {
@@ -300,7 +345,9 @@ class VisionPreview
   }
 
   /**
-   * @brief 停止预览线程、注销 web stream，并等待后台线程退出。
+   * @brief 停止预览线程，注销 web stream 并等待后台线程退出。
+   *        Stop the preview thread, unregister the web stream and wait for the background
+   *        thread to exit.
    */
   void Stop()
   {
