@@ -154,10 +154,12 @@ preview.Submit(frame, [result](cv::Mat& image) {
 
 硬件：窗口模式使用的显示后端（`DISPLAY` 或 `WAYLAND_DISPLAY`），或 Web 模式使用的网络接口。
 
-测试：在启用 `BUILD_TESTING` 的 BSP 构建中，模块加入 `vision_preview_restart_test`（重启、并发生命周期、worker 失败回滚、HTTP 客户端回收与慢客户端停止），用 `ctest` 运行。
-
 Dependencies: LibXR (logging) and OpenCV 4 (`core`, `imgproc`, `highgui`), brought in by `CMakeLists.txt` through `find_package(OpenCV 4 REQUIRED ...)`.
 
 Hardware: the display backend used by the window mode (`DISPLAY` or `WAYLAND_DISPLAY`), or the network interface used by the Web mode.
 
-Tests: in a BSP build with `BUILD_TESTING` enabled, the Module adds `vision_preview_restart_test` (restart, concurrent lifecycle, worker failure rollback, HTTP client recycling and slow client stop), run with `ctest`.
+## 7. 测试 / Tests
+
+在启用 `BUILD_TESTING` 的 BSP 构建中，模块加入 `vision_preview_restart_test`（重启、并发生命周期、工作线程失败回滚、HTTP 客户端回收与慢客户端停止），用 `ctest` 运行。
+
+In a BSP build with `BUILD_TESTING` enabled, the Module adds `vision_preview_restart_test` (restart, concurrent lifecycle, worker failure rollback, HTTP client recycling and slow client stop), run with `ctest`.
