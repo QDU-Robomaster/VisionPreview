@@ -1,69 +1,16 @@
-name: XRobot Module Build Test
-
+name: Module CI
 on:
   push:
   pull_request:
-  schedule:
-    - cron: '0 3 1 * *'
-
+  workflow_dispatch:
 jobs:
   build:
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/xrobot-org/docker-image-webots:main
-      options: --user 0
-
-    steps:
-      - name: Checkout current module repo
-        uses: actions/checkout@v4
-        with:
-          path: Modules/VisionPreview
-
-      - name: Pull libxr
-        run: |
-          git clone --depth=1 --branch master \
-            https://github.com/Jiu-xiao/libxr ./libxr
-
-      - name: Create compile smoke test
-        run: |
-          cat > main.cpp <<'EOF'
-          #include "VisionPreview.hpp"
-
-          int main() {
-              VisionPreview preview;
-              cv::Mat frame(8, 8, CV_8UC3);
-              (void)preview.Submit(frame, [](cv::Mat& canvas) {
-                  (void)canvas;
-              });
-              return 0;
-          }
-          EOF
-
-          cat > CMakeLists.txt <<'EOF'
-          cmake_minimum_required(VERSION 3.10)
-          project(vision_preview_smoke CXX)
-          set(CMAKE_CXX_STANDARD 20)
-          set(CMAKE_CXX_STANDARD_REQUIRED ON)
-          set(XROBOT_MODULES_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Modules/)
-          set(WEBOTS_HOME /usr/local/webots)
-          add_executable(vision_preview_smoke main.cpp)
-          add_subdirectory(libxr)
-          target_include_directories(
-            vision_preview_smoke
-            PUBLIC $<TARGET_PROPERTY:xr,INTERFACE_INCLUDE_DIRECTORIES>
-          )
-          target_link_libraries(vision_preview_smoke PUBLIC xr)
-          get_property(_xr_module_deps GLOBAL PROPERTY XR_MODULE_DEPS)
-          if(_xr_module_deps)
-            target_link_libraries(vision_preview_smoke PUBLIC ${_xr_module_deps})
-          endif()
-          EOF
-
-      - name: Build
-        run: |
-          cmake -S . -B build -DBUILD_TESTING=ON
-          cmake --build build -j$(nproc)
-
-      - name: Test
-        run: |
-          ctest --test-dir build/libxr --output-on-failure --no-tests=error
+    uses: xrobot-org/XRobot/.github/workflows/module-ci.yml@dev
+    with:
+      xrobot-ref: dev
+      libxr-ref: dev
+      dependency-ref: refs/heads/dev
+      template-args: '[]'
+      image: 'ghcr.io/xrobot-org/docker-image-webots:main'
+      cmake-options: '-DWEBOTS_HOME=/usr/local/webots'
+      ctest-regex: '^vision_preview_'
