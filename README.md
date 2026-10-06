@@ -1,6 +1,6 @@
 # VisionPreview
 
-自瞄网页预览：浏览器拉取原始 Bayer 帧与各层结果，在网页端解码和画图 / Auto-aim web preview: the browser pulls raw Bayer frames and stage results and decodes and draws them itself
+自瞄网页预览：浏览器拉取原始 Bayer 帧与各层结果，在网页端解码和画图 / Auto-aim web preview where the browser pulls raw Bayer frames and stage results and decodes and draws them itself
 
 ## 1. 模块作用 / Purpose
 
