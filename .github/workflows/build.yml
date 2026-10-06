@@ -8,6 +8,5 @@ jobs:
     uses: xrobot-org/XRobot/.github/workflows/module-ci.yml@v1
     with:
       template-args: '[]'
-      image: 'ghcr.io/xrobot-org/docker-image-webots:main'
-      cmake-options: '-DWEBOTS_HOME=/usr/local/webots'
+      apt-packages: 'libeigen3-dev'
       ctest-regex: '^vision_preview_'

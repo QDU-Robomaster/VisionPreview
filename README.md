@@ -1,165 +1,82 @@
 # VisionPreview
 
-实时视觉预览库：异步绘制并输出到 OpenCV 窗口或浏览器 / Real-time vision preview library that draws asynchronously and outputs to an OpenCV window or a browser
+自瞄网页预览：浏览器拉取原始 Bayer 帧与各层结果，在网页端解码和画图 / Auto-aim web preview: the browser pulls raw Bayer frames and stage results and decodes and draws them itself
 
 ## 1. 模块作用 / Purpose
 
-VisionPreview 用于实时查看视觉模块输出的画面。调用方提交一帧 OpenCV 图像和绘制函数，预览线程在图像拷贝上绘制内容，再输出到 OpenCV 窗口或浏览器。ArmorDetector、ArmorTracker、Aimer、VisionCapture 等模块按各自的结果绘制框、文字、轨迹或标定板角点。
+VisionPreview 在车上开一个 HTTP 端口。浏览器打开 `http://<主机>:<端口>/` 后，页面循环请求 `/frame`；每次请求，模块从自瞄链路上最深且新鲜的一层复制下一帧，连同这一层及之前各层的结果发回。服务端不去马赛克、不编码图像、不画图，这些都在浏览器里做。
 
-调用 `Start()`（或使用带 `RuntimeParam` 的构造函数）后，`Submit(frame, draw)` 先检查 `max_fps`。通过限频后，模块在调用线程深拷贝图像并放入队列，随即返回。预览线程取出图像，执行 `draw(cv::Mat&)`，按 `preview_scale` 缩放，再显示或推流。
+VisionPreview opens an HTTP port on the robot. A browser opening `http://<host>:<port>/` gets a page that requests `/frame` in a loop; for each request the Module copies the next frame of the deepest fresh stage of the auto-aim chain and sends it back with the results of that stage and the ones before it. The server does no demosaicing, image encoding or drawing; the browser does all of that.
 
-队列长度至多为 2。预览线程来不及处理时，模块丢弃最早的等待帧，相机、检测或跟踪线程继续运行。`Stop()` 释放仍在等待的任务并等待预览线程退出；同一实例再次 `Start()` 时处理新会话的帧。预览线程抛出异常时，模块记录错误并停止本次会话，之后可以重新 `Start()`。
+页面上画的内容：
 
-VisionPreview shows the output of the vision Modules in real time. The caller submits an OpenCV image and a draw function, the preview thread draws on a copy of the image, and the result is output to an OpenCV window or a browser. Modules such as ArmorDetector, ArmorTracker, Aimer and VisionCapture draw boxes, text, trajectories or board corners according to their own results.
+- 检测框（红、蓝按颜色）与编号、置信度；
+- 跟踪目标的各块板和中心（绿色）；
+- 瞄点：不开火为橙色十字，开火时为红色并加圆圈；
+- 右侧文字：显示的是哪一层、帧序号与帧计数、帧几何，以及每一层最新的序号和距今时间（超过 100 ms 标红），检测数、目标编号与当前板、瞄准结果。
 
-After `Start()` is called (or the constructor with `RuntimeParam` is used), `Submit(frame, draw)` first checks `max_fps`. When the rate limit is passed, the Module deep-copies the image in the calling thread, puts it into the queue and returns. The preview thread takes the image, runs `draw(cv::Mat&)`, scales it by `preview_scale` and then displays or streams it.
+The page draws:
 
-The queue length is at most 2. When the preview thread cannot keep up, the Module drops the oldest waiting frame and the camera, detection or tracking threads continue to run. `Stop()` releases the tasks still waiting and waits for the preview thread to exit; when the same instance is started again, it processes the frames of the new session. When the preview thread throws an exception, the Module logs the error and stops the session, after which `Start()` can be called again.
+- detections (red or blue by colour) with number and confidence;
+- the plates and centre of the tracked target (green);
+- the aim point: an orange cross when not firing, red with a circle when firing;
+- text on the right: which stage is shown, the sequence and frame counter, the frame geometry, the latest sequence and age of every stage (red above 100 ms), the number of detections, the target number and face, and the aim result.
 
-## 2. 输出模式 / Output Modes
+## 2. 取哪一层 / Which Stage Is Shown
 
-`output_mode: "window"` 使用 OpenCV 窗口，运行环境需要 `DISPLAY` 或 `WAYLAND_DISPLAY`，缺少时预览不启动。
+模块订阅 `<相机名>_synced`，以及已存在的 `<相机名>_detected`、`_tracked`、`_aimed`。各层回调平时只记录序号和到达时间。浏览器请求时，模块选出 `fresh_ms` 内收到过帧的最深一层，等它的下一帧（最多 300 ms）并复制下来；等不到就退回同步层再等一次。某一层卡住时画面仍然更新，页面上能看到是哪一层停了。
 
-`output_mode: "raw"`、`"bmp"`、`"web"`、`"http"` 启动内置 HTTP 服务（非 Windows 平台）。每帧编码为未压缩 24 位 BMP，以 `multipart/x-mixed-replace` 推送，浏览器访问：
+The Module subscribes to `<camera>_synced` and to whichever of `<camera>_detected`, `_tracked` and `_aimed` exist. Stage callbacks normally record only the sequence and arrival time. On a request the Module picks the deepest stage that received a frame within `fresh_ms`, waits for its next frame (at most 300 ms) and copies it; otherwise it falls back to the synced stage and waits once more. When a stage stalls the picture keeps updating and the page shows which stage stopped.
 
-```text
-http://<host>:<web_port>/
-http://<host>:<web_port>/stream/<web_stream_name>
+复制只在浏览器等待时发生（每帧约 0.3 MB），模块不持有图像句柄，不占相机的图像槽。没人打开页面时不复制。
+
+Copies happen only while a browser waits (about 0.3 MB per frame); the Module keeps no image handle and holds no camera image slot. Nothing is copied when no page is open.
+
+## 3. `/frame` 格式 / `/frame` Format
+
+响应体依次为：4 字节小端的 JSON 长度、JSON、640×512 BayerRG8 原始字节。JSON 中的坐标都是帧像素（检测角点由原生像素按帧几何换算，目标与瞄点用帧携带的标定和 `TrackedFrame` 的世界到相机变换投影）：
+
+The body is the JSON length as 4 little-endian bytes, the JSON, then the 640×512 BayerRG8 bytes. All coordinates in the JSON are frame pixels (detection corners are mapped from native pixels by the frame geometry; the target and aim point are projected with the calibration carried by the frame and the world-to-camera transform of `TrackedFrame`):
+
+```json
+{"stage":"aimed","sequence":580,"timestamp_us":11600000,"frame_counter":580,
+ "width":640,"height":512,"geometry":{"roi_x":80,"roi_y":24,"decimation":2},
+ "quaternion":[1,0,0,0],
+ "stages":[{"name":"synced","present":true,"seen":true,"sequence":580,"age_ms":0.4}, …],
+ "armors":[{"color":"blue","number":"three","conf":0.93,"corners":[[x,y],…]}],
+ "target":{"number":"three","face":0,"centre":[x,y],"plates":[[[x,y],…],…]},
+ "aim":{"control":true,"fire":false,"yaw":0.1,"pitch":0.02,"plate":0,"point":[x,y]}}
 ```
 
-同一进程内的多个 `VisionPreview` 共用同一个 `web_bind_address:web_port`。每个实例注册自己的 stream，stream 名各不相同。根路径列出当前所有 stream；只有一个 stream 时也可访问 `/stream`。每个服务同时服务的客户端最多 16 个；最后一个 stream 注销后服务关闭。
+没有到达的层对应字段为 `null` 或空数组。页面把每个 2×2 Bayer 单元拼成一个像素（320×256）再放大显示。
 
-计数：
+Fields of stages not reached are `null` or empty. The page turns every 2×2 Bayer cell into one pixel (320×256) and scales it up.
 
-- `AcceptedFrames()`：通过限频并进入队列的帧数。
-- `RateDroppedFrames()`：被 `max_fps` 丢弃的帧数。
-- `DroppedFrames()`：队列满时丢弃的等待帧数。
-
-这些计数用于判断预览是否跟得上视觉链路，`Stop()` 时打印到日志。
-
-`output_mode: "window"` uses an OpenCV window and requires `DISPLAY` or `WAYLAND_DISPLAY` in the environment; the preview does not start when both are missing.
-
-`output_mode: "raw"`, `"bmp"`, `"web"` and `"http"` start the built-in HTTP service (non-Windows platforms). Each frame is encoded as an uncompressed 24-bit BMP and pushed as `multipart/x-mixed-replace`; the browser opens the addresses in the code block above.
-
-Several `VisionPreview` instances in one process share one `web_bind_address:web_port`. Each instance registers its own stream, and the stream names differ. The root path lists all current streams; `/stream` is also available when there is only one stream. Each service serves at most 16 clients at the same time; the service shuts down after the last stream is unregistered.
-
-Counters:
-
-- `AcceptedFrames()`: frames that passed the rate limit and entered the queue.
-- `RateDroppedFrames()`: frames dropped by `max_fps`.
-- `DroppedFrames()`: waiting frames dropped because the queue was full.
-
-The counters show whether the preview keeps up with the vision chain and are printed to the log at `Stop()`.
-
-## 3. 构造接口 / Constructor
-
-```cpp
-class VisionPreview {
- public:
-  struct RuntimeParam { ... };
-  using DrawCallback = std::function<void(cv::Mat&)>;
-
-  VisionPreview();                               // 未启动 / not started
-  explicit VisionPreview(RuntimeParam runtime);  // 构造并 Start(runtime) / construct and Start(runtime)
-
-  bool Start(RuntimeParam runtime);
-  void Stop();
-  bool Running() const;
-  bool Submit(const cv::Mat& frame, DrawCallback draw);
-
-  uint32_t AcceptedFrames() const;
-  uint32_t RateDroppedFrames() const;
-  uint32_t DroppedFrames() const;
-};
-```
-
-`Start()` 在配置关闭或启动失败时返回 `false`。`Submit()` 在未运行、空图像、被限频或会话已切换时返回 `false`，成功入队时返回 `true`。
-
-依赖：无。
-
-配置参数（`RuntimeParam`）：
-
-- `enabled`：预览总开关，默认 `false`；为 `false` 时不启动线程，`Submit()` 返回 `false`。
-- `preview_window_name`：OpenCV 窗口名，也是默认 stream 名的来源，默认 `"autoaim_preview"`。
-- `preview_scale`：输出缩放比例，作用于预览图，默认 `1.0`。
-- `preview_wait_key_ms`：窗口模式下 `cv::waitKey()` 的等待时间，单位 ms，最小按 1 执行，默认 `1`。
-- `queue_capacity`：预览队列长度，取值限制在 1 到 2，默认 `1`。
-- `output_mode`：`"window"`，或 `"raw"` / `"bmp"` / `"web"` / `"http"`，默认 `"window"`。
-- `web_bind_address`：HTTP 监听地址，远程查看时使用 `"0.0.0.0"`，默认 `"0.0.0.0"`。
-- `web_port`：HTTP 监听端口，默认 `8080`。
-- `web_stream_name`：stream 名，默认为空，此时由 `preview_window_name` 生成（保留字母、数字、`_`、`-`，`.` 和空格转为 `_`）。
-- `max_fps`：预览接受的最大帧率，默认 `30.0`；小于等于 0 表示不限频。
-
-`Start()` returns `false` when the configuration is disabled or the start fails. `Submit()` returns `false` when the preview is not running, the image is empty, the rate limit drops the frame or the session has changed, and `true` when the frame was queued.
-
-Dependencies: none.
-
-Configuration parameters (`RuntimeParam`):
-
-- `enabled`: master switch of the preview, default `false`; with `false` no thread is started and `Submit()` returns `false`.
-- `preview_window_name`: OpenCV window name and the source of the default stream name, default `"autoaim_preview"`.
-- `preview_scale`: output scale applied to the preview image, default `1.0`.
-- `preview_wait_key_ms`: wait time of `cv::waitKey()` in window mode in ms, at least 1 is used, default `1`.
-- `queue_capacity`: preview queue length, limited to 1 to 2, default `1`.
-- `output_mode`: `"window"`, or `"raw"` / `"bmp"` / `"web"` / `"http"`, default `"window"`.
-- `web_bind_address`: HTTP listen address, `"0.0.0.0"` serves remote viewing, default `"0.0.0.0"`.
-- `web_port`: HTTP listen port, default `8080`.
-- `web_stream_name`: stream name, default empty, in which case it is generated from `preview_window_name` (letters, digits, `_` and `-` are kept, `.` and spaces become `_`).
-- `max_fps`: maximum accepted frame rate of the preview, default `30.0`; a value less than or equal to 0 disables the rate limit.
-
-## 4. Topic
-
-无 / None
-
-## 5. 配置示例 / Configuration Example
-
-VisionPreview 是库（`standalone: false`），由其他模块在 `depends` 中声明并包含 `VisionPreview.hpp`，实例由使用它的模块创建。这些模块的配置带有 `RuntimeParam` 字段，在 BSP 的 `User/xrobot.yaml` 中按 YAML map 填写，字符串字段写成 C++ 字符串字面量。以下为 `QDU-Robomaster/VisionCapture` 的 `preview_in`：
-
-VisionPreview is a library (`standalone: false`) that other Modules declare in `depends` and use by including `VisionPreview.hpp`; the instance is created by the Module that uses it. The configuration of these Modules has a `RuntimeParam` field, filled in as a YAML map in the BSP `User/xrobot.yaml`, with string fields written as C++ string literals. The following is the `preview_in` of `QDU-Robomaster/VisionCapture`:
+## 4. 配置示例 / Configuration Example
 
 ```yaml
-preview_in:
-  enabled: true
-  preview_window_name: "vision_capture"
-  preview_scale: 0.5
-  preview_wait_key_ms: 1
-  queue_capacity: 1
-  output_mode: "web"
-  web_bind_address: "0.0.0.0"
-  web_port: 8080
-  web_stream_name: "vision_capture"
-  max_fps: 30.0
+modules:
+  - module: QDU-Robomaster/VisionPreview
+    id: preview
+    args:
+      - settings:
+          camera_name: "gimbal"
+          port: 8080
+          fresh_ms: 100
 ```
 
-浏览器访问 `http://<host>:8080/stream/vision_capture` 查看画面。在 C++ 中直接使用：
+预览实例列在同一相机的 CFS（或回放相机）、检测器、跟踪器与 Aimer 之后，构造时只订阅已存在的层。`port` 为 0 时由系统分配，实际端口写在启动日志里。
 
-The browser opens `http://<host>:8080/stream/vision_capture` to view the image. Direct use in C++:
+The preview instance is listed after the CFS (or replay camera), detector, tracker and Aimer of the same camera, and subscribes only to the stages that exist at construction. With `port` 0 the system chooses the port, which the startup log reports.
 
-```cpp
-VisionPreview preview({
-    .enabled = true,
-    .preview_window_name = "detector_preview",
-    .preview_scale = 0.5,
-    .output_mode = "window",
-});
+## 5. 测试 / Tests
 
-preview.Submit(frame, [result](cv::Mat& image) {
-  // 在 image 上绘制框、文字或轨迹 / draw boxes, text or trajectories on image
-});
-```
+`tests/preview_test.cpp` 检查：原生角点换到帧像素、目标中心与瞄点的投影、JSON 字段；通过本机 HTTP 取页面、404、`/frame` 的长度与内容，检测层持续发布时显示检测层，检测层停止 200 ms 后退回同步层并仍列出检测层的状态。
 
-## 6. 依赖与硬件 / Dependencies and Hardware
+`tests/preview_test.cpp` checks the mapping of native corners to frame pixels, the projection of the target centre and aim point, and the JSON fields; over local HTTP it fetches the page, a 404, and `/frame` with its length and content, sees the detected stage while detections are published, and the fallback to the synced stage 200 ms after detections stop, with the detected stage still listed.
 
-依赖：LibXR（日志），OpenCV 4（`core`、`imgproc`、`highgui`），由 `CMakeLists.txt` 通过 `find_package(OpenCV 4 REQUIRED ...)` 引入。
+## 6. 依赖 / Dependencies
 
-硬件：窗口模式使用的显示后端（`DISPLAY` 或 `WAYLAND_DISPLAY`），或 Web 模式使用的网络接口。
+AutoAimTypes（含 CameraBase）、LibXR、Linux 套接字。
 
-Dependencies: LibXR (logging) and OpenCV 4 (`core`, `imgproc`, `highgui`), brought in by `CMakeLists.txt` through `find_package(OpenCV 4 REQUIRED ...)`.
-
-Hardware: the display backend used by the window mode (`DISPLAY` or `WAYLAND_DISPLAY`), or the network interface used by the Web mode.
-
-## 7. 测试 / Tests
-
-在启用 `BUILD_TESTING` 的 BSP 构建中，模块加入 `vision_preview_restart_test`（重启、并发生命周期、工作线程失败回滚、HTTP 客户端回收与慢客户端停止），用 `ctest` 运行。
-
-In a BSP build with `BUILD_TESTING` enabled, the Module adds `vision_preview_restart_test` (restart, concurrent lifecycle, worker failure rollback, HTTP client recycling and slow client stop), run with `ctest`.
+AutoAimTypes (with CameraBase), LibXR, Linux sockets.
