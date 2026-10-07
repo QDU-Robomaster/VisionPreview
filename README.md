@@ -10,14 +10,14 @@ VisionPreview opens an HTTP port on the robot. A browser opening `http://<host>:
 
 页面上画的内容：
 
-- 检测框（红、蓝按颜色）与编号、置信度；
+- 检测框（按颜色画成红、蓝、紫、灭灯为灰）与编号、置信度；
 - 跟踪目标的各块板和中心（绿色）；
 - 瞄点：不开火为橙色十字，开火时为红色并加圆圈；
 - 右侧文字：显示的是哪一层、帧序号与帧计数、帧几何，以及每一层最新的序号和距今时间（超过 100 ms 标红），检测数、目标编号与当前板、瞄准结果。
 
 The page draws:
 
-- detections (red or blue by colour) with number and confidence;
+- detections (red, blue, purple, or grey for lights off, by colour) with number and confidence;
 - the plates and centre of the tracked target (green);
 - the aim point: an orange cross when not firing, red with a circle when firing;
 - text on the right: which stage is shown, the sequence and frame counter, the frame geometry, the latest sequence and age of every stage (red above 100 ms), the number of detections, the target number and face, and the aim result.

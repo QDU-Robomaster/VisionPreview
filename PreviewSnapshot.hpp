@@ -293,9 +293,11 @@ inline std::string ToJson(const Snapshot& s,
     std::snprintf(buf, sizeof(buf),
                   "%s{\"color\":\"%s\",\"number\":\"%.*s\",\"conf\":%.2f,\"corners\":",
                   i > 0 ? "," : "",
-                  a.color == ArmorColor::RED    ? "red"
-                  : a.color == ArmorColor::BLUE ? "blue"
-                                                : "unknown",
+                  a.color == ArmorColor::RED      ? "red"
+                  : a.color == ArmorColor::BLUE   ? "blue"
+                  : a.color == ArmorColor::PURPLE ? "purple"
+                  : a.color == ArmorColor::OFF    ? "off"
+                                                  : "unknown",
                   static_cast<int>(name.size()), name.data(), a.confidence);
     out += buf;
     AppendQuad(out, a.corners);

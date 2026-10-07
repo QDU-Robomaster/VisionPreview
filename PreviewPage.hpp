@@ -70,7 +70,7 @@ function cross(p, colour, r) {
 function draw(j) {
   ctx.font = '12px monospace';
   for (const a of j.armors) {
-    const c = a.color === 'red' ? '#f44' : a.color === 'blue' ? '#4af' : '#ccc';
+    const c = {red: '#f44', blue: '#4af', purple: '#c6f', off: '#888'}[a.color] || '#ccc';
     quad(a.corners, c, 2);
     ctx.fillStyle = c;
     ctx.fillText(a.number + ' ' + a.conf.toFixed(2), a.corners[0][0], a.corners[0][1] - 4);
