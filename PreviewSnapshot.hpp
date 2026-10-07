@@ -166,6 +166,19 @@ inline void Fill(Snapshot& s, const AutoAim::TrackedFrame& f)
   const double hw =
       large ? AutoAim::LARGE_ARMOR_HALF_WIDTH : AutoAim::SMALL_ARMOR_HALF_WIDTH;
   const double hh = AutoAim::ARMOR_HALF_HEIGHT;
+  // 相机在世界系中的位置 −Rᵀt，只画朝向相机的板（背面与侧面被车身挡住）。
+  // Camera position in the world, −Rᵀt; only plates facing the camera are drawn (the
+  // back and the sides are hidden by the body).
+  const auto& rot = f.output_to_camera_rotation;
+  const auto& tr = f.output_to_camera_translation;
+  Eigen::Vector3d camera = Eigen::Vector3d::Zero();
+  for (int i = 0; i < 3; ++i)
+  {
+    for (int j = 0; j < 3; ++j)
+    {
+      camera(j) -= rot[3 * i + j] * tr[i];
+    }
+  }
   for (int i = 0; i < t.armors_num; ++i)
   {
     const double a = t.yaw + i * 2.0 * M_PI / t.armors_num;
@@ -174,6 +187,11 @@ inline void Fill(Snapshot& s, const AutoAim::TrackedFrame& f)
     const Eigen::Vector3d centre(t.position.x() + r * std::sin(a),
                                  t.position.y() - r * std::cos(a),
                                  t.position.z() + (odd ? t.dz : 0.0));
+    const Eigen::Vector3d outward(std::sin(a), -std::cos(a), 0.0);
+    if (outward.dot(camera - centre) <= 0.0)
+    {
+      continue;
+    }
     const Eigen::Vector3d side(std::cos(a), std::sin(a), 0.0);  // 板的横向 / Lateral
     const Eigen::Vector3d up(0.0, 0.0, 1.0);
     const Eigen::Vector3d corners[4] = {

@@ -92,7 +92,10 @@ void TestSnapshot()
   Expect(s.target && s.target->centre && Near(s.target->centre->x, 320.25) &&
              Near(s.target->centre->y, 258.25),
          "target centre projected");
-  Expect(s.target->plates.size() == 4, "four plates in front of the camera");
+  // 朝向 0 的车只有正面一块朝向相机 / At heading 0 only the front plate faces the camera.
+  Expect(s.target->plates.size() == 1 &&
+             Near((s.target->plates[0][0].x + s.target->plates[0][2].x) / 2, 320.25),
+         "only the plate facing the camera");
   Expect(s.aim && s.aim->point && Near(s.aim->point->x, 320.25), "aim point projected");
 
   std::array<Preview::StageStatus, Preview::STAGE_COUNT> status{};
